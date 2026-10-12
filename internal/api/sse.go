@@ -1,9 +1,8 @@
-// Package api menyediakan Server-Sent Events (SSE) hub untuk
-// pembaruan real-time ke UI tanpa polling berlebihan.
+// Package api menyediakan SSEHub untuk mengelola dan menyiarkan
+// event real-time ke klien melalui Server-Sent Events (SSE).
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -12,10 +11,9 @@ import (
 	"time"
 )
 
-// SSEHub mengelola daftar pelanggan (subscribers) dan menyiarkan
-// peristiwa ke semua pelanggan yang terhubung.
+// SSEHub mengelola langganan klien SSE dan menyiarkan pesan ke semua klien terhubung.
 type SSEHub struct {
-	mu          sync.RWMutex
+	mu          sync.Mutex
 	subscribers map[chan string]struct{}
 }
 
@@ -26,89 +24,74 @@ func NewSSEHub() *SSEHub {
 	}
 }
 
-// Broadcast mengirimkan peristiwa ke semua pelanggan yang terhubung.
-// event adalah nama peristiwa (mis. "alert", "connection", "device").
-// data adalah struktur yang akan di-serialize ke JSON.
-func (h *SSEHub) Broadcast(event string, data interface{}) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	jsonData, err := json.Marshal(data)
+// Broadcast memformat event dan data menjadi format SSE standar lalu mengirimkannya
+// ke seluruh klien yang sedang berlangganan.
+func (h *SSEHub) Broadcast(event string, data any) {
+	payload, err := json.Marshal(data)
 	if err != nil {
-		slog.Error("gagal marshal SSE data", "error", err)
+		slog.Error("gagal serialisasi data SSE", "error", err)
 		return
 	}
 
-	// Format SSE: event: <name>\ndata: <json>\n\n
-	message := fmt.Sprintf("event: %s\ndata: %s\n\n", event, jsonData)
+	msg := fmt.Sprintf("event: %s\ndata: %s\n\n", event, string(payload))
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
 	for ch := range h.subscribers {
 		select {
-		case ch <- message:
-			// Terkirim
+		case ch <- msg:
 		default:
-			// Channel penuh: drop event untuk mencegah blocking hub
-			// Pelanggan lambat akan kehilangan event ini
+			// Klien lambat, abaikan agar tidak memblokir
 		}
 	}
 }
 
-// ServeHTTP menangani koneksi SSE masuk dari klien.
+// ServeHTTP menangani koneksi HTTP untuk endpoint SSE.
 func (h *SSEHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Set header SSE
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming tidak didukung pada server ini", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*") // Local only anyway
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// Buat channel untuk pelanggan ini
-	ch := make(chan string, 256)
+	ch := make(chan string, 10)
+
 	h.mu.Lock()
 	h.subscribers[ch] = struct{}{}
 	h.mu.Unlock()
 
-	// Pastikan cleanup saat koneksi ditutup
-	ctx := r.Context()
 	defer func() {
 		h.mu.Lock()
 		delete(h.subscribers, ch)
-		h.mu.Unlock()
 		close(ch)
+		h.mu.Unlock()
 	}()
 
-	// Kirim heartbeat setiap 15 detik untuk menjaga koneksi hidup
-	heartbeatTicker := time.NewTicker(15 * time.Second)
-	defer heartbeatTicker.Stop()
+	// Kirim komentar awal agar koneksi langsung terbuka
+	_, _ = fmt.Fprintf(w, ": connected\n\n")
+	flusher.Flush()
 
-	// Flusher diperlukan untuk memaksa penulisan ke klien
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		slog.Error("http.ResponseWriter tidak mendukung Flushing")
-		http.Error(w, "Streaming tidak didukung", http.StatusInternalServerError)
-		return
-	}
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
 
-	// Loop utama: kirim pesan ke klien
+	ctx := r.Context()
+
 	for {
 		select {
-		case msg := <-ch:
-			// Kirim pesan event ke klien
-			if _, err := fmt.Fprint(w, msg); err != nil {
-				slog.Debug("klien SSE terputus", "error", err)
-				return
-			}
-			flusher.Flush()
-
-		case <-heartbeatTicker.C:
-			// Kirim komentar heartbeat untuk menjaga koneksi hidup
-			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
-				return
-			}
-			flusher.Flush()
-
 		case <-ctx.Done():
-			// Klien menutup koneksi atau context dibatalkan
 			return
+		case <-ticker.C:
+			_, _ = fmt.Fprintf(w, ": ping\n\n")
+			flusher.Flush()
+		case msg := <-ch:
+			_, _ = fmt.Fprint(w, msg)
+			flusher.Flush()
 		}
 	}
 }

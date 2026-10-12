@@ -1,130 +1,191 @@
-// Package advisory menghasilkan rekomendasi berbasis bahasa Indonesia
-// berdasarkan keadaan jaringan dan peringatan yang aktif.
+// Package alert menyediakan logika pembentukan rekomendasi praktis
+// bagi pengguna awam berdasarkan kondisi dan temuan jaringan.
 package alert
 
 import (
+	"fmt"
+
 	"github.com/google/uuid"
 	"shadowscanner/internal/storage"
 )
 
-// Recommendation merepresentasikan satu nasihat praktis untuk pengguna.
+// Recommendation menyajikan satu saran tindakan konkret dalam bahasa Indonesia
+// dengan penjelasan sederhana mengapa tindakan tersebut disarankan.
 type Recommendation struct {
-	ID       string    // Identifier unik untuk rekomendasi ini
-	Title    string    // Judul singkat, maksimal 6 kata
-	Why      string    // "Kenapa?" penjelasan singkat dalam bahasa Indonesia
-	Steps    []string  // Langkah-langkah yang bisa diambil pengguna
-	Severity Severity  // Tingkat keparahan yang sesuai
+	ID       string   // Pengenal unik rekomendasi
+	Title    string   // Judul rekomendasi yang singkat dan jelas
+	Why      string   // Penjelasan alasan di balik rekomendasi dalam bahasa sederhana
+	Steps    []string // Langkah-langkah bernomor yang dapat segera dilakukan
+	Severity Severity // Tingkat urgensi saran: "aman", "perhatian", atau "bahaya"
 }
 
-// Generate menghasilkan rekomendasi berdasarkan daftar peringatan
-// dan perangkat yang terdeteksi. Jika ada peringatan berbahaya,
-// rekomendasi paling penting akan ditempatkan pertama.
+// Generate menyusun daftar rekomendasi dari kumpulan peringatan aktif dan perangkat terdaftar.
 func Generate(alerts []Alert, devices []storage.Device) []Recommendation {
 	var recs []Recommendation
-	seenIDs := make(map[string]struct{})
+	seenTitles := make(map[string]bool)
 
-	// Cek semua peringatan yang ada
-	for _, a := range alerts {
-		switch a.Category {
-		case "arp":
-			if addUnique(recs, seenIDs, mk("Pindah ke jaringan lain",
-				"ARP spoofing berarti seseorang menyehingginkan ia bisa membaca semua lalu lintas internet Anda.",
-				[]string{"Putuskan WiFi sekarang", "Hubungkan ke jaringan lain (misalnya hotspot ponsel)", "Periksa router Anda untuk pengaturan yang mencurigakan"},
-				SeverityDanger)) {
-				recs = append(recs, mk("Pindah ke jaringan lain",
-					"ARP spoofing berarti seseorang menyehingginkan ia bisa membaca semua lalu lintas internet Anda.",
-					[]string{"Putuskan WiFi sekarang", "Hubungkan ke jaringan lain (misalnya hotspot ponsel)", "Periksa router Anda untuk pengaturan yang mencurigakan"},
-					SeverityDanger))
-			}
-		case "dhcp":
-			if addUnique(recs, seenIDs, mk("Laporkan ke pengelola jaringan",
-				"Server DHCP tidak sah bisa memberikan konfigurasi jaringan yang mengarahkan lalu lintas Anda ke jalur yang salah.",
-				[]string{"Matikan perangkat tak terduga yang tersambung", "Hubungi pengelola jaringan Anda", "Periksa router untuk port yang tidak dikenal"},
-				SeverityDanger)) {
-				recs = append(recs, mk("Laporkan ke pengelola jaringan",
-					"Server DHCP tidak sah bisa memberikan konfigurasi jaringan yang mengarahkan lalu lintas Anda ke jalur yang salah.",
-					[]string{"Matikan perangkat tak terduga yang tersambung", "Hubungi pengelola jaringan Anda", "Periksa router untuk port yang tidak dikenal"},
-					SeverityDanger))
-			}
-		case "inject":
-			if addUnique(recs, seenIDs, mk("Tutup browser dan jangan login",
-				"Penyisipan skrip berarti seseorang mencoba mencuri data dari browser Anda.",
-				[]string{"Tutup semua tab browser", "Jangan login ke situs apapun sampai beralih jaringan", "Bersihkan cache dan cookie browser setelah pindah jaringan"},
-				SeverityDanger)) {
-				recs = append(recs, mk("Tutup browser dan jangan login",
-					"Penyisipan skrip berarti seseorang mencoba mencuri data dari browser Anda.",
-					[]string{"Tutup semua tab browser", "Jangan login ke situs apapun sampai beralih jaringan", "Bersihkan cache dan cookie browser setelah pindah jaringan"},
-					SeverityDanger))
-			}
-		case "gateway":
-			if addUnique(recs, seenIDs, mk("Sambung ulang WiFi Anda",
-				"Perubahan gateway berarti perangkat yang menghubungkan Anda ke internet telah berubah.",
-				[]string{"Putuskan dan sambungkan kembali WiFi", "Periksa apakah Anda baru saja mengganti router", "Jika tidak sengaja, perhatikan lalu lintas Anda"},
-				SeverityAttention)) {
-				recs = append(recs, mk("Sambung ulang WiFi Anda",
-					"Perubahan gateway berarti perangkat yang menghubungkan Anda ke internet telah berubah.",
-					[]string{"Putuskan dan sambungkan kembali WiFi", "Periksa apakah Anda baru saja mengganti router", "Jika tidak sengaja, perhatikan lalu lintas Anda"},
-					SeverityAttention))
-			}
-		case "mac":
-			if addUnique(recs, seenIDs, mk("Hindari berbagi file",
-				"Duplikasi MAC berarti ada perangkat yang tak Terduga dalam jaringan Anda.",
-				[]string{"Putuskan perangkat yang tidak dikenali dari jaringan", "Gunakan jaringan terpisah untuk berbagi file", "Periksa pengaturan router Anda"},
-				SeverityAttention)) {
-				recs = append(recs, mk("Hindari berbagi file",
-					"Duplikasi MAC berarti ada perangkat yang tidak terduga dalam jaringan Anda.",
-					[]string{"Putuskan perangkat yang tidak dikenali dari jaringan", "Gunakan jaringan terpisah untuk berbagi file", "Periksa pengaturan router Anda"},
-					SeverityAttention))
-			}
-		case "dns":
-			if addUnique(recs, seenIDs, mk("Hindari transaksi online",
-				"Permintaan DNS mencurigakan berarti ada perangkat yang mencoba menghubungi server berbahaya.",
-					"Tidak ada rekomendasi khusus, jaringan Anda terlihat normal."},
-			Severity: SeveritySafe,
+	addRec := func(title, why string, steps []string, sev Severity) {
+		if seenTitles[title] {
+			return
+		}
+		seenTitles[title] = true
+		recs = append(recs, Recommendation{
+			ID:       uuid.New().String(),
+			Title:    title,
+			Why:      why,
+			Steps:    steps,
+			Severity: sev,
 		})
 	}
 
-	// Pastikan ada setidaknya satu rekomendasi
+	hasDanger := false
+	hasARPSpoof := false
+	hasRogueDHCP := false
+	hasMACSpoof := false
+	hasGatewayChange := false
+	hasSuspiciousDNS := false
+	hasScriptInject := false
+
+	for _, a := range alerts {
+		if a.Severity == SeverityDanger {
+			hasDanger = true
+		}
+		switch a.Category {
+		case "arp":
+			hasARPSpoof = true
+		case "dhcp":
+			hasRogueDHCP = true
+		case "mac":
+			hasMACSpoof = true
+		case "gateway":
+			hasGatewayChange = true
+		case "dns":
+			hasSuspiciousDNS = true
+		case "inject":
+			hasScriptInject = true
+		}
+	}
+
+	// 1. Any "bahaya" alert active -> "Pindah ke jaringan lain"
+	if hasDanger {
+		addRec(
+			"Pindah ke jaringan lain",
+			"Terdeteksi ancaman aktif yang dapat membahayakan privasi dan data akun pribadi Anda di jaringan ini.",
+			[]string{
+				"Matikan sambungan Wi-Fi atau cabut kabel LAN komputer Anda.",
+				"Beralihlah ke jaringan tethering ponsel atau koneksi lain yang terpercaya.",
+				"Hindari membuka layanan perbankan atau email sebelum berpindah jaringan.",
+			},
+			SeverityDanger,
+		)
+	}
+
+	// 2. ARP spoofing detected -> "Putuskan koneksi sekarang"
+	if hasARPSpoof {
+		addRec(
+			"Putuskan koneksi sekarang",
+			"Ada perangkat yang mencoba menyamar sebagai router untuk membaca lalu lintas internet Anda.",
+			[]string{
+				"Putuskan Wi-Fi perangkat Anda seketika.",
+				"Jangan memasukkan username atau password apa pun di peramban.",
+				"Gunakan koneksi data seluler pribadi untuk keperluan mendesak.",
+			},
+			SeverityDanger,
+		)
+	}
+
+	// 3. Script injection detected -> "Tutup browser dan jangan login"
+	if hasScriptInject {
+		addRec(
+			"Tutup browser dan jangan login",
+			"Terdapat upaya penyisipan kode asing ke dalam halaman web yang Anda kunjungi.",
+			[]string{
+				"Tutup seluruh tab peramban yang sedang terbuka.",
+				"Jangan menekan tombol login atau mengisi formulir data rahasia.",
+				"Bersihkan riwayat dan cache peramban setelah pindah koneksi.",
+			},
+			SeverityDanger,
+		)
+	}
+
+	// 4. Rogue DHCP detected -> "Laporkan ke pengelola jaringan"
+	if hasRogueDHCP {
+		addRec(
+			"Laporkan ke pengelola jaringan",
+			"Ditemukan server pengatur alamat jaringan liar yang mencoba mengontrol sambungan komputer Anda.",
+			[]string{
+				"Beri tahu staf IT atau pemilik tempat bahwa terdeteksi DHCP liar di jaringan.",
+				"Putuskan koneksi sampai pengelola jaringan mengatasi perangkat tersebut.",
+			},
+			SeverityDanger,
+		)
+	}
+
+	// 5. MAC spoofing detected -> "Hindari berbagi file di jaringan ini"
+	if hasMACSpoof {
+		addRec(
+			"Hindari berbagi file di jaringan ini",
+			"Ada dua perangkat berbeda yang menggunakan alamat identitas yang serupa.",
+			[]string{
+				"Nonaktifkan fitur File Sharing dan Network Discovery di komputer Anda.",
+				"Gunakan media penyimpanan fisik jika perlu memindahkan berkas.",
+			},
+			SeverityAttention,
+		)
+	}
+
+	// 6. Gateway change detected -> "Sambung ulang WiFi"
+	if hasGatewayChange {
+		addRec(
+			"Sambung ulang WiFi",
+			"Alamat router utama terdeteksi berubah, kemungkinan router di-restart atau dialihkan.",
+			[]string{
+				"Matikan Wi-Fi selama 5 detik lalu hidupkan kembali.",
+				"Pastikan nama jaringan (SSID) yang terhubung adalah jaringan resmi yang benar.",
+			},
+			SeverityAttention,
+		)
+	}
+
+	// 7. Suspicious DNS detected -> "Hindari transaksi online di jaringan ini"
+	if hasSuspiciousDNS {
+		addRec(
+			"Hindari transaksi online di jaringan ini",
+			"Pencarian alamat situs menunjukkan indikasi pengalihan ke tujuan yang mencurigakan.",
+			[]string{
+				"Tunda transaksi perbankan atau pembayaran digital sampai koneksi terjamin aman.",
+				"Pastikan alamat situs selalu diawali 'https://' dan memiliki lambang gembok terkunci.",
+			},
+			SeverityAttention,
+		)
+	}
+
+	// 8. Kondisi perangkat mencurigakan dari daftar devices
+	if len(devices) > 50 {
+		addRec(
+			"Waspada keramaian perangkat di jaringan publik",
+			fmt.Sprintf("Terdeteksi %d perangkat dalam satu subnet. Jaringan yang sangat ramai lebih rentan disusupi.", len(devices)),
+			[]string{
+				"Pastikan firewall sistem operasi Anda selalu dalam status aktif.",
+				"Gunakan layanan VPN terpercaya jika harus bekerja di jaringan publik.",
+			},
+			SeverityAttention,
+		)
+	}
+
+	// 9. Default jika tidak ada peringatan khusus
 	if len(recs) == 0 {
-		recs = append(recs, defaultRecommendation())
+		addRec(
+			"Jaringan terlihat normal",
+			"Tidak ditemukan kejanggalan atau aktivitas mencurigakan pada pemindaian terakhir.",
+			[]string{
+				"Tetap aktifkan pemantauan otomatis ShadowScanner saat berada di jaringan baru.",
+				"Pastikan kata sandi Wi-Fi dan perangkat Anda menggunakan kombinasi yang kuat.",
+				"Perbarui sistem operasi secara teratur untuk menutup celah keamanan.",
+			},
+			SeveritySafe,
+		)
 	}
 
 	return recs
-}
-
-// mk adalah helper untuk menciptakan Recommendation dengan ID unik.
-func mk(title, why string, steps []string, sev Severity) Recommendation {
-	return Recommendation{
-		ID:       uuid.New().String(),
-		Title:    title,
-		Why:      why,
-		Steps:    steps,
-		Severity: sev,
-	}
-}
-
-// addUnique menambahkan rekomendasi ke slice dan mengembalikan true jika
-// berhasil ditambahkan (ID belum ada di seenIDs).
-func addUnique(recs *[]Recommendation, seen map[string]struct{}, rec Recommendation) bool {
-	if _, ok := seen[rec.ID]; ok {
-		return false
-	}
-	seen[rec.ID] = struct{}{}
-	*recs = append(*recs, rec)
-	return true
-}
-
-// defaultRecommendation mengembalikan rekomendasi default ketika tidak ada
-// peringatan yang perlu diwaspadai.
-func defaultRecommendation() Recommendation {
-	return Recommendation{
-		ID:    uuid.New().String(),
-		Title: "Jaringan terlihat normal",
-		Why:   "Tidak ada aktivitas mencurigakan yang terdeteksi pada jaringan Anda saat ini.",
-		Steps: []string{
-			"Pantau peringatan secara berkala",
-			"Perbarui router dan perangkat Anda secara rutin",
-			"Gunakan koneksi terenkripsi (HTTPS, VPN) untuk kegiatan sensitif"},
-		Severity: SeveritySafe,
-	}
 }

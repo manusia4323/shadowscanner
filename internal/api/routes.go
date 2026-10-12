@@ -1,324 +1,379 @@
-// Package api berisi handler untuk semua rute HTTP ShadowScanner.
+// Package api menyediakan fungsi dan rute penanganan HTTP untuk ShadowScanner.
 package api
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
 
 	"shadowscanner/internal/alert"
-	"shadowscanner/internal/config"
-	"shadowscanner/internal/history"
 	"shadowscanner/internal/local"
+	"shadowscanner/internal/scanner"
 	"shadowscanner/internal/storage"
+	"shadowscanner/internal/ui"
 )
 
-// ----- Helper types for JSON responses -----
+// registerRoutes mendaftarkan seluruh endpoint API ke ServeMux.
+func (s *Server) registerRoutes(mux *http.ServeMux) {
+	// Aset statis UI (CSS, JS) di bawah /assets/
+	mux.Handle("/assets/", http.StripPrefix("/assets/", ui.Handler()))
 
-type apiResponse struct {
-	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
-	Code    string      `json:"code,omitempty"`
+	// Halaman utama UI tertanam (index.html)
+	mux.HandleFunc("/", s.handleIndex)
+
+	// API Endpoints
+	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/api/self", s.handleSelf)
+	mux.HandleFunc("/api/devices", s.handleDevices)
+	mux.HandleFunc("/api/alerts", s.handleAlerts)
+	mux.HandleFunc("/api/alerts/acknowledge", s.handleAcknowledgeAlert)
+	mux.HandleFunc("/api/connections", s.handleConnections)
+	mux.HandleFunc("/api/connections/stream", s.handleConnectionsStream)
+	mux.HandleFunc("/api/alerts/stream", s.handleAlertsStream)
+	mux.HandleFunc("/api/history", s.handleHistory)
+	mux.HandleFunc("/api/retention", s.handleSetRetention)
+	mux.HandleFunc("/api/recommendations", s.handleRecommendations)
+	mux.HandleFunc("/api/scan/start", s.handleScanStart)
+	mux.HandleFunc("/api/scan/stop", s.handleScanStop)
+	mux.HandleFunc("/api/settings", s.handleSettings)
 }
 
-func writeJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		slog.Error("gagal encode JSON response", "error", err)
-	}
-}
-
-func writeError(w http.ResponseWriter, status int, msg, code string) {
-	writeJSON(w, status, apiResponse{Success: false, Error: msg, Code: code})
-}
-
-func writeSuccess(w http.ResponseWriter, data interface{}) {
-	writeJSON(w, http.StatusOK, apiResponse{Success: true, Data: data})
-}
-
-// ----- Main handlers -----
-
-// handleIndex melayani halaman UI utama.
+// handleIndex menyajikan halaman utama antarmuka web ShadowScanner dari
+// aset statis yang tertanam (embedded index.html).
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	// Embedded HTML akan disuntikkan di Session 4
-	// Untuk sekarang, kembalikan placeholder
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	html, err := ui.IndexHTML()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "gagal memuat antarmuka")
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, `<!DOCTYPE html>
-<html lang="id">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>ShadowScanner — Pemeriksa Jaringan</title>
-    <meta name="csrf" content="{{CSRF}}">
-    <style>
-        body { font-family: system-ui; max-width: 800px; margin: 40px auto; padding: 20px; background: #0f1115; color: #e6e8ee; }
-        .card { background: #171a21; border: 1px solid #232733; border-radius: 8px; padding: 24px; margin-bottom: 16px; }
-        h1 { color: #60a5fa; }
-        .status { display: inline-block; padding: 8px 16px; border-radius: 20px; background: #34d399; color: #0f1115; font-weight: 600; }
-        .btn { display: inline-block; padding: 12px 24px; background: #60a5fa; color: #0f1115; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; }
-        .btn:hover { background: #3b82f6; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>ShadowScanner</h1>
-        <p class="status">Aman — Server berjalan</p>
-        <p>Aplikasi ini memeriksa jaringan Anda untuk menemukan aktivitas mencurigakan.</p>
-        <button class="btn" onclick="fetch('/api/scan/start', {method:'POST'}).then(r=>r.json()).then(d=>alert(JSON.stringify(d)))">Pindai Sekarang</button>
-    </div>
-    <div class="card">
-        <h2>Endpoint API</h2>
-        <ul>
-            <li>GET /api/health — Cek kesehatan server</li>
-            <li>GET /api/self — Info perangkat Anda</li>
-            <li>GET /api/devices — Perangkat di jaringan</li>
-            <li>GET /api/alerts — Peringatan keamanan</li>
-            <li>GET /api/connections — Koneksi jaringan aktif</li>
-            <li>GET /api/connections/stream — SSE stream koneksi baru</li>
-            <li>GET /api/alerts/stream — SSE stream peringatan baru</li>
-            <li>GET /api/history — Riwayat pemindaian</li>
-            <li>GET /api/recommendations — Rekomendasi keamanan</li>
-            <li>POST /api/scan/start — Mulai pemindaian</li>
-        </ul>
-    </div>
-    <script>
-        // SSE connection for alerts
-        const esAlerts = new EventSource('/api/alerts/stream');
-        esAlerts.onmessage = (e) => console.log('Alert:', e.data);
-        esAlerts.onerror = () => console.log('SSE alerts disconnected');
-    </script>
-</body>
-</html>`)
+	_, _ = w.Write(html)
 }
 
 // handleHealth mengembalikan status kesehatan server.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeSuccess(w, map[string]string{"status": "ok", "service": "shadowscanner"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":    "ok",
+		"timestamp": time.Now().Format(time.RFC3339),
+	})
 }
 
-// handleSelf mengembalikan informasi perangkat pengguna.
+// handleSelf mengembalikan informasi perangkat lokal dan antarmuka jaringan.
 func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
 	info, err := local.Get(r.Context())
 	if err != nil {
-		slog.Error("gagal mendapatkan info perangkat", "error", err)
-		writeError(w, http.StatusInternalServerError, "Gagal mendapatkan info perangkat", "SELF_INFO_FAILED")
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeSuccess(w, info)
+	writeJSON(w, http.StatusOK, info)
 }
 
-// handleDevices mengembalikan daftar perangkat yang terdeteksi.
+// handleDevices mengembalikan daftar perangkat yang terdeteksi di jaringan.
 func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 	devices, err := s.db.ListDevices()
 	if err != nil {
-		slog.Error("gagal mendapatkan daftar perangkat", "error", err)
-		writeError(w, http.StatusInternalServerError, "Gagal mendapatkan daftar perangkat", "DEVICES_LIST_FAILED")
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeSuccess(w, devices)
+	writeJSON(w, http.StatusOK, devices)
 }
 
-// handleAlerts mengembalikan daftar peringatan, dengan filter severity opsional.
+// handleAlerts mengembalikan daftar peringatan keamanan.
 func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
-	severity := r.URL.Query().Get("severity")
-	alerts, err := s.db.ListAlerts(severity)
+	alerts, err := s.db.ListAlerts("")
 	if err != nil {
-		slog.Error("gagal mendapatkan daftar peringatan", "error", err)
-		writeError(w, http.StatusInternalServerError, "Gagal mendapatkan daftar peringatan", "ALERTS_LIST_FAILED")
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeSuccess(w, alerts)
+	writeJSON(w, http.StatusOK, alerts)
 }
 
 // handleAcknowledgeAlert menandai peringatan sebagai sudah dibaca.
 func (s *Server) handleAcknowledgeAlert(w http.ResponseWriter, r *http.Request) {
-	idStr := r.PathValue("id")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Metode tidak diizinkan", http.StatusMethodNotAllowed)
+		return
+	}
+	idStr := r.URL.Query().Get("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "ID peringatan tidak valid", "INVALID_ID")
+		writeError(w, http.StatusBadRequest, "Parameter id tidak valid")
 		return
 	}
 
-	if err := s.engine.Acknowledge(r.Context(), id); err != nil {
-		slog.Error("gagal mengakui peringatan", "error", err, "id", id)
-		writeError(w, http.StatusInternalServerError, "Gagal mengakui peringatan", "ACK_FAILED")
+	if err := s.engine.Acknowledge(id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	writeSuccess(w, map[string]string{"status": "acknowledged"})
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
-// handleConnections mengembalikan daftar koneksi jaringan.
+// handleConnections mengembalikan daftar koneksi jaringan aktif.
 func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
-	limitStr := r.URL.Query().Get("limit")
-	limit := 100
-	if limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
-			limit = l
-		}
-	}
-
-	conns, err := s.db.ListConnections(limit)
+	conns, err := s.db.ListConnections(100)
 	if err != nil {
-		slog.Error("gagal mendapatkan daftar koneksi", "error", err)
-		writeError(w, http.StatusInternalServerError, "Gagal mendapatkan daftar koneksi", "CONNECTIONS_LIST_FAILED")
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeSuccess(w, conns)
+	writeJSON(w, http.StatusOK, conns)
 }
 
-// handleConnectionsStream melayani SSE stream untuk koneksi baru.
+// handleConnectionsStream menyediakan SSE untuk aliran koneksi jaringan real-time.
 func (s *Server) handleConnectionsStream(w http.ResponseWriter, r *http.Request) {
 	s.hub.ServeHTTP(w, r)
 }
 
-// handleAlertsStream melayani SSE stream untuk peringatan baru.
+// handleAlertsStream menyediakan SSE untuk aliran peringatan keamanan real-time.
 func (s *Server) handleAlertsStream(w http.ResponseWriter, r *http.Request) {
 	s.hub.ServeHTTP(w, r)
 }
 
-// handleHistory mengembalikan riwayat pemindaian.
+// handleHistory mengembalikan ringkasan riwayat pemindaian.
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	limitStr := r.URL.Query().Get("limit")
-	limit := 50
-	if limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
-			limit = l
-		}
-	}
-
-	scans, err := s.db.ListScans(limit)
+	scans, err := s.db.ListScans(50)
 	if err != nil {
-		slog.Error("gagal mendapatkan riwayat pemindaian", "error", err)
-		writeError(w, http.StatusInternalServerError, "Gagal mendapatkan riwayat pemindaian", "HISTORY_LIST_FAILED")
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeSuccess(w, scans)
+	writeJSON(w, http.StatusOK, scans)
 }
 
-// handleSetRetention mengubah durasi penyimpanan data.
+// handleSetRetention memperbarui durasi retensi data.
 func (s *Server) handleSetRetention(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Hours int `json:"hours"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "Format JSON tidak valid", "INVALID_JSON")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Metode tidak diizinkan", http.StatusMethodNotAllowed)
 		return
 	}
-
-	// Validasi range
-	if req.Hours < 1 || req.Hours > 720 {
-		writeError(w, http.StatusBadRequest, "Retention hours harus antara 1 dan 720", "INVALID_RETENTION")
+	hoursStr := r.URL.Query().Get("hours")
+	hours, err := strconv.Atoi(hoursStr)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Parameter hours tidak valid")
 		return
 	}
-
-	// Buat instance Retention sementara untuk mengubah pengaturan
-	retention := history.New(s.cfg, s.db)
-	if err := retention.SetHours(r.Context(), req.Hours); err != nil {
-		slog.Error("gagal mengubah retention", "error", err)
-		writeError(w, http.StatusInternalServerError, "Gagal mengubah durasi penyimpanan", "RETENTION_SET_FAILED")
+	if hours < 1 || hours > 720 {
+		writeError(w, http.StatusBadRequest, "Durasi retensi harus antara 1 sampai 720 jam")
 		return
 	}
-
-	writeSuccess(w, map[string]interface{}{
-		"retention_hours": req.Hours,
-		"message":         "Durasi penyimpanan diperbarui",
-	})
+	if err := s.db.SetSetting("retention_hours", strconv.Itoa(hours)); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "retention_hours": hours})
 }
 
-// handleRecommendations mengembalikan rekomendasi keamanan.
+// handleRecommendations mengembalikan saran rekomendasi tindakan keamanan.
 func (s *Server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
+	dbAlerts, err := s.db.ListAlerts("")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	var alerts []alert.Alert
+	for _, a := range dbAlerts {
+		alerts = append(alerts, alert.Alert{
+			ID:          a.ID,
+			Timestamp:   a.Timestamp,
+			Severity:    alert.Severity(a.Severity),
+			Category:    a.Category,
+			Title:       a.Title,
+			Explanation: a.Explanation,
+			Action:      a.Action,
+			Technical:   a.Technical,
+			DeviceMAC:   a.DeviceMAC,
+		})
+	}
+
 	devices, err := s.db.ListDevices()
 	if err != nil {
-		slog.Error("gagal mendapatkan perangkat untuk rekomendasi", "error", err)
-		writeError(w, http.StatusInternalServerError, "Gagal memproses rekomendasi", "RECS_FAILED")
-		return
-	}
-
-	alerts, err := s.db.ListAlerts("")
-	if err != nil {
-		slog.Error("gagal mendapatkan peringatan untuk rekomendasi", "error", err)
-		writeError(w, http.StatusInternalServerError, "Gagal memproses rekomendasi", "RECS_FAILED")
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	recs := alert.Generate(alerts, devices)
-	writeSuccess(w, recs)
+	writeJSON(w, http.StatusOK, recs)
 }
 
-// handleScanStart memulai pemindaian jaringan baru.
+// handleScanStart memulai pemindaian manual.
 func (s *Server) handleScanStart(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implementasi pemindaian penuh akan mengintegrasikan
-	// discovery, ports, fingerprint, distance, isp, dan alert engine.
-	// Untuk Session 3, kembalikan respons placeholder.
-	writeSuccess(w, map[string]string{
-		"status":  "started",
-		"message": "Pemindaian dimulai (implementasi lengkap di Session 4)",
-	})
-}
-
-// handleScanStop menghentikan pemindaian yang sedang berlangsung.
-func (s *Server) handleScanStop(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implementasi menghentikan pemindaian yang berjalan
-	writeSuccess(w, map[string]string{
-		"status":  "stopped",
-		"message": "Pemindaian dihentikan (implementasi lengkap di Session 4)",
-	})
-}
-
-// handleSettings mengembalikan pengaturan saat ini.
-func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
-	// Kunci pengaturan yang dikenal
-	keys := []string{"retention_hours", "warning_mode", "scan_interval"}
-	settings := make(map[string]string)
-
-	for _, key := range keys {
-		val, err := s.db.GetSetting(key)
-		if err == nil {
-			settings[key] = val
-		}
-	}
-
-	writeSuccess(w, settings)
-}
-
-// handleUpdateSettings memperbarui pengaturan.
-func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
-	var req map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "Format JSON tidak valid", "INVALID_JSON")
+	if r.Method != http.MethodPost {
+		http.Error(w, "Metode tidak diizinkan", http.StatusMethodNotAllowed)
 		return
 	}
 
-	allowed := map[string]bool{
-		"retention_hours":  true,
-		"warning_mode":     true,
-		"scan_interval":    true,
-		"max_devices":      true,
-		"log_level":        true,
-		"network_interface": true,
-		"capture_device":   true,
-		"browser_launch":   true,
+	s.scanMu.Lock()
+	if s.scanning {
+		s.scanMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": false,
+			"message": "pemindaian sedang berlangsung",
+		})
+		return
 	}
+	s.scanning = true
+	scanCtx, cancel := context.WithCancel(context.Background())
+	s.scanCancel = cancel
+	s.scanMu.Unlock()
 
-	for key, val := range req {
-		if !allowed[key] {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("Pengaturan %s tidak diizinkan diubah", key), "SETTING_NOT_ALLOWED")
+	s.hub.Broadcast("scan", map[string]any{"status": "started", "timestamp": time.Now()})
+
+	go func() {
+		defer func() {
+			s.scanMu.Lock()
+			s.scanning = false
+			s.scanCancel = nil
+			s.scanMu.Unlock()
+		}()
+
+		startedAt := time.Now()
+		if s.scanner == nil {
+			slog.Warn("komponen scanner belum diinisialisasi")
+			s.hub.Broadcast("scan", map[string]any{"status": "error", "message": "scanner belum diinisialisasi"})
 			return
 		}
-		if err := s.db.SetSetting(key, val); err != nil {
-			slog.Error("gagal memperbarui pengaturan", "key", key, "error", err)
-			writeError(w, http.StatusInternalServerError, "Gagal memperbarui pengaturan", "SETTING_UPDATE_FAILED")
+
+		devices, err := s.scanner.Scan(scanCtx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				slog.Info("pemindaian dibatalkan pengguna")
+				s.hub.Broadcast("scan", map[string]any{"status": "stopped", "message": "pemindaian dibatalkan"})
+			} else {
+				slog.Error("pemindaian gagal", "error", err)
+				s.hub.Broadcast("scan", map[string]any{"status": "error", "message": err.Error()})
+			}
 			return
+		}
+
+		for _, dev := range devices {
+			if scanCtx.Err() != nil {
+				break
+			}
+
+			// Periksa port terbuka
+			ports, _ := scanner.CheckPorts(scanCtx, dev.IP, 300*time.Millisecond)
+
+			// Tebak tipe perangkat
+			fp := scanner.Guess(dev, ports)
+
+			// Estimasi jarak fisik kasar
+			dist := scanner.Estimate(scanCtx, dev)
+
+			now := time.Now()
+			storageDev := &storage.Device{
+				MAC:                dev.MAC,
+				IP:                 dev.IP,
+				Hostname:           dev.Hostname,
+				Vendor:             fp.Vendor,
+				DeviceType:         fp.DeviceType,
+				FirstSeen:          now,
+				LastSeen:           now,
+				Confidence:         fp.Confidence,
+				DistanceEstimate:   dist.Meters,
+				DistanceConfidence: dist.Confidence,
+			}
+
+			_ = s.db.UpsertDevice(storageDev)
+			s.hub.Broadcast("device", storageDev)
+		}
+
+		// Simpan ringkasan ke riwayat scans
+		_, _ = s.db.InsertScan(&storage.Scan{
+			StartedAt:   startedAt,
+			FinishedAt:  time.Now(),
+			DeviceCount: len(devices),
+			AlertCount:  0,
+		})
+
+		s.hub.Broadcast("scan", map[string]any{
+			"status":        "completed",
+			"devices_found": len(devices),
+			"finished_at":   time.Now(),
+		})
+	}()
+
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "pemindaian dimulai"})
+}
+
+// handleScanStop menghentikan pemindaian aktif.
+func (s *Server) handleScanStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Metode tidak diizinkan", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.scanMu.Lock()
+	if !s.scanning || s.scanCancel == nil {
+		s.scanMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"message": "tidak ada pemindaian aktif",
+		})
+		return
+	}
+	s.scanCancel()
+	s.scanMu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "pemindaian dihentikan"})
+}
+
+// handleSettings membaca atau memperbarui pengaturan aplikasi.
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		var req map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "Format JSON tidak valid")
+			return
+		}
+		for k, v := range req {
+			_ = s.db.SetSetting(k, v)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"success": true})
+		return
+	}
+
+	retStr, err := s.db.GetSetting("retention_hours")
+	retHours := 8
+	if err == nil && retStr != "" {
+		if h, parseErr := strconv.Atoi(retStr); parseErr == nil {
+			retHours = h
 		}
 	}
 
-	writeSuccess(w, map[string]string{"status": "updated"})
+	warnStr, _ := s.db.GetSetting("warning_mode")
+	warningMode := s.cfg.WarningMode
+	if warnStr == "true" {
+		warningMode = true
+	} else if warnStr == "false" {
+		warningMode = false
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"port":            s.cfg.Port,
+		"retention_hours": retHours,
+		"warning_mode":    warningMode,
+	})
+}
+
+// Helper untuk mengirim respons JSON
+func writeJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+// Helper untuk mengirim pesan error JSON
+func writeError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": message})
 }

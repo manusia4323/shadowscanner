@@ -1,228 +1,166 @@
-// Package fingerprint guesses device type from multiple weak signals:
-// MAC OUI lookup, hostname patterns, open ports, and vendor keywords.
-// Each signal contributes 0.2 to confidence, capped at 1.0.
-package fingerprint
+// Package scanner menyediakan fungsi pemindaian defensif untuk jaringan lokal.
+package scanner
 
 import (
+	"fmt"
 	"strings"
 )
 
-// Fingerprint holds the result of guessing device type.
+// Fingerprint merekam hasil tebakan tipe perangkat berdasarkan kombinasi sinyal-sinyal lemah.
 type Fingerprint struct {
-	DeviceType string   // e.g., "Router", "Ponsel", "Laptop", "Printer", "TV", "Kamera IP", "IoT", "Perangkat tidak dikenal"
-	Vendor     string   // Vendor name from OUI lookup
-	Confidence float64  // Confidence score 0.0 - 1.0
-	Signals    []string // Human-readable reasons for the guess
+	DeviceType string   // "Router", "Ponsel", "Laptop", "Printer", "TV", "Kamera IP", "IoT", atau "Perangkat tidak dikenal"
+	Vendor     string   // Nama pabrikan
+	Confidence float64  // Nilai keyakinan 0.0 - 1.0
+	Signals    []string // Alasan dan bukti sinyal dalam bahasa yang mudah dipahami
 }
 
-// Guess infers device type from weak signals. Each matched signal adds 0.2
-// to confidence, capped at 1.0. If no signal matches, returns
-// "Perangkat tidak dikenal" with confidence 0.0.
+// Guess menebak tipe perangkat berdasarkan alamat MAC OUI, nama host, dan port terbuka.
+// Setiap sinyal yang cocok menyumbang nilai 0.2 pada skor keyakinan (maksimum 1.0).
 func Guess(dev Device, ports []PortResult) Fingerprint {
 	var signals []string
 	confidence := 0.0
+	guessedType := ""
 
-	// 1. MAC OUI lookup provides vendor info
 	vendor := dev.Vendor
-	fp := Fingerprint{
-		Vendor: vendor,
+	if vendor == "" {
+		vendor = LookupVendor(dev.MAC)
 	}
 
-	// Build lowercase hostname for pattern matching
-	hostnameLower := strings.ToLower(dev.Hostname)
-
-	// 2. Hostname patterns
-	hostnameType := guessFromHostname(hostnameLower)
-	if hostnameType != "" {
-		signals = append(signals, "Hostname: "+dev.Hostname)
+	// 1. Sinyal dari MAC OUI Vendor
+	if vendor != "" {
+		signals = append(signals, fmt.Sprintf("Pabrikan dikenali: %s", vendor))
 		confidence += 0.2
-		fp.DeviceType = hostnameType
-	}
 
-	// 3. Open ports signal
-	portType, portMatched := guessFromPorts(ports)
-	if portMatched {
-		signals = append(signals, guessFromPortsDescription(ports))
-		confidence += 0.2
-		if fp.DeviceType == "" {
-			fp.DeviceType = portType
+		vLower := strings.ToLower(vendor)
+		if strings.Contains(vLower, "tp-link") ||
+			strings.Contains(vLower, "mikrotik") ||
+			strings.Contains(vLower, "ubiquiti") ||
+			strings.Contains(vLower, "cisco") ||
+			strings.Contains(vLower, "netgear") {
+			guessedType = "Router"
+		} else if strings.Contains(vLower, "hikvision") || strings.Contains(vLower, "dahua") {
+			guessedType = "Kamera IP"
+		} else if strings.Contains(vLower, "espressif") || strings.Contains(vLower, "raspberry") {
+			guessedType = "IoT"
+		} else if strings.Contains(vLower, "samsung") {
+			guessedType = "Ponsel"
+		} else if strings.Contains(vLower, "apple") {
+			guessedType = "Laptop" // Apple dapat berupa ponsel atau laptop, disesuaikan oleh hostname nanti
 		}
 	}
 
-	// 4. Vendor name keywords (from OUI)
-	vendorType, vendorMatched := guessFromVendor(strings.ToLower(vendor))
-	if vendorMatched {
-		signals = append(signals, "Vendor: "+vendor)
-		confidence += 0.2
-		if fp.DeviceType == "" {
-			fp.DeviceType = vendorType
+	// 2. Sinyal dari pola Hostname
+	if dev.Hostname != "" {
+		hLower := strings.ToLower(dev.Hostname)
+		hType := matchHostnamePattern(hLower)
+		if hType != "" {
+			signals = append(signals, fmt.Sprintf("Nama host cocok (%s): %s", hType, dev.Hostname))
+			confidence += 0.2
+			guessedType = hType
 		}
 	}
 
-	// Final type determination
-	if fp.DeviceType == "" && confidence == 0 {
-		fp.DeviceType = "Perangkat tidak dikenal"
-	}
-	// If only one type determined, use that. If multiple, prioritize hostname
-	// then ports then vendor. We'll pick the first non-empty type.
-	if fp.DeviceType == "" {
-		// Check if any type was determined by signals but confidence wasn't set
-		// This shouldn't happen, but just in case:
-		fp.DeviceType = "Perangkat tidak dikenal"
+	// 3. Sinyal dari Port Terbuka
+	portType, matchedPorts := matchPortSignals(ports)
+	if portType != "" {
+		signals = append(signals, fmt.Sprintf("Port terbuka khas (%s): port %v", portType, matchedPorts))
+		confidence += 0.2
+		// Jika belum ada tebakan atau tebakan sebelumnya adalah generic, gunakan portType
+		if guessedType == "" || guessedType == "Perangkat tidak dikenal" {
+			guessedType = portType
+		}
 	}
 
-	// Cap confidence at 1.0
+	// 4. Batasi skor confidence maksimal 1.0
 	if confidence > 1.0 {
 		confidence = 1.0
 	}
-	fp.Confidence = confidence
-	fp.Signals = signals
 
-	return fp
+	if guessedType == "" || confidence == 0 {
+		guessedType = "Perangkat tidak dikenal"
+		confidence = 0.0
+	}
+
+	return Fingerprint{
+		DeviceType: guessedType,
+		Vendor:     vendor,
+		Confidence: confidence,
+		Signals:    signals,
+	}
 }
 
-// guessFromHostname matches hostname substring patterns against known device types.
-// Returns device type or empty string if no match.
-func guessFromHostname(hostname string) string {
-	if hostname == "" {
+// matchHostnamePattern mencocokkan substring nama host dengan tipe perangkat.
+func matchHostnamePattern(h string) string {
+	switch {
+	case containsAny(h, "iphone", "ipad", "android", "pixel", "samsung", "xiaomi", "redmi", "oppo", "vivo"):
+		return "Ponsel"
+	case containsAny(h, "desktop-", "laptop-", "macbook", "thinkpad", "pc-", "notebook"):
+		return "Laptop"
+	case containsAny(h, "raspberrypi", "esp-", "esp32", "tasmota", "shelly", "arduino"):
+		return "IoT"
+	case containsAny(h, "printer", "hp-", "canon", "epson", "brother"):
+		return "Printer"
+	case containsAny(h, "tv", "chromecast", "roku", "firestick", "smarttv", "bravia"):
+		return "TV"
+	case containsAny(h, "camera", "ipcam", "hikvision", "dahua", "cctv", "cam-"):
+		return "Kamera IP"
+	case containsAny(h, "router", "gateway", "openwrt", "mikrotik", "tplink", "accesspoint", "ap-"):
+		return "Router"
+	default:
 		return ""
 	}
-
-	// Mobile devices
-	if contains(hostname, "iphone", "ipad", "android", "pixel", "samsung", "xiaomi") {
-		return "Ponsel"
-	}
-
-	// Laptops
-	if contains(hostname, "desktop-", "laptop-", "macbook", "thinkpad") {
-		return "Laptop"
-	}
-
-	// IoT devices
-	if contains(hostname, "raspberrypi", "esp-", "tasmota", "shelly") {
-		return "IoT"
-	}
-
-	// Printers
-	if contains(hostname, "printer", "hp ", "canon", "epson", "brother") {
-		return "Printer"
-	}
-
-	// Smart TV / streaming
-	if contains(hostname, "tv", "chromecast", "roku", "firestick") {
-		return "TV"
-	}
-
-	// IP Cameras
-	if contains(hostname, "camera", "ipcam", "hikvision", "dahua") {
-		return "Kamera IP"
-	}
-
-	// Routers / gateways
-	if contains(hostname, "router", "gateway", "openwrt", "mikrotik", "tplink") {
-		return "Router"
-	}
-
-	return ""
 }
 
-// guessFromPorts checks open ports against known patterns to guess device type.
-// Returns device type and true if a port pattern matched.
-func guessFromPorts(ports []PortResult) (string, bool) {
-	hasPort := func(p int) bool {
-		for _, port := range ports {
-			if port.Open && port.Port == p {
-				return true
-			}
-		}
-		return false
-	}
-
-	// Check patterns in priority order
-	// 3389 open -> Windows Laptop
-	if hasPort(3389) {
-		return "Laptop", true
-	}
-
-	// 22 + 80/443 open -> Linux/embedded: IoT or Router
-	if hasPort(22) && (hasPort(80) || hasPort(443)) {
-		return "IoT", true
-	}
-
-	// 445 + 139 open -> Windows file sharing -> Laptop
-	if hasPort(445) && hasPort(139) {
-		return "Laptop", true
-	}
-
-	// 9100 open -> Printer (rare, kept for v2)
-	if hasPort(9100) {
-		return "Printer", true
-	}
-
-	return "", false
-}
-
-// guessFromPortsDescription returns a human-readable string describing
-// which ports were detected as significant.
-func guessFromPortsDescription(ports []PortResult) string {
-	var openPorts []string
+// matchPortSignals memeriksa port terbuka yang menjadi indikator kuat jenis perangkat.
+func matchPortSignals(ports []PortResult) (string, []int) {
+	openMap := make(map[int]bool)
 	for _, p := range ports {
 		if p.Open {
-			openPorts = append(openPorts, strconv.Itoa(p.Port))
+			openMap[p.Port] = true
 		}
 	}
-	if len(openPorts) == 0 {
-		return "No significant ports open"
+
+	// 3389 open -> Windows Remote Desktop -> Laptop / PC
+	if openMap[3389] {
+		return "Laptop", []int{3389}
 	}
-	return "Open ports: " + strings.Join(openPorts, ", ")
+
+	// 445 + 139 open -> SMB File Sharing -> Laptop / PC
+	if openMap[445] && openMap[139] {
+		return "Laptop", []int{139, 445}
+	}
+
+	// 22 open + 80 atau 443 open -> Embedded Linux Router / IoT
+	if openMap[22] && (openMap[80] || openMap[443]) {
+		var matched []int
+		matched = append(matched, 22)
+		if openMap[80] {
+			matched = append(matched, 80)
+		}
+		if openMap[443] {
+			matched = append(matched, 443)
+		}
+		return "Router", matched
+	}
+
+	// 80 atau 443 terbuka saja -> Web interface router atau printer
+	if openMap[80] || openMap[443] {
+		var matched []int
+		if openMap[80] {
+			matched = append(matched, 80)
+		}
+		if openMap[443] {
+			matched = append(matched, 443)
+		}
+		return "Router", matched
+	}
+
+	return "", nil
 }
 
-// guessFromVendor checks vendor name keywords against known patterns.
-// Returns device type and true if a vendor pattern matched.
-func guessFromVendor(vendorLower string) (string, bool) {
-	if vendorLower == "" {
-		return "", false
-	}
-
-	// Apple -> Ponsel or Laptop (ambiguous, but default to Laptop)
-	if strings.Contains(vendorLower, "apple") {
-		return "Laptop", true
-	}
-
-	// Samsung -> Ponsel
-	if strings.Contains(vendorLower, "samsung") {
-		return "Ponsel", true
-	}
-
-	// Networking vendors -> Router
-	if strings.Contains(vendorLower, "tp-link") ||
-		strings.Contains(vendorLower, "mikrotik") ||
-		strings.Contains(vendorLower, "ubiquiti") ||
-		strings.Contains(vendorLower, "cisco") ||
-		strings.Contains(vendorLower, "netgear") {
-		return "Router", true
-	}
-
-	// Camera vendors -> Kamera IP
-	if strings.Contains(vendorLower, "hikvision") ||
-		strings.Contains(vendorLower, "dahua") {
-		return "Kamera IP", true
-	}
-
-	// Printer vendors
-	if strings.Contains(vendorLower, "hp ") ||
-		strings.Contains(vendorLower, "canon") ||
-		strings.Contains(vendorLower, "epson") ||
-		strings.Contains(vendorLower, "brother") {
-		return "Printer", true
-	}
-
-	return "", false
-}
-
-// contains checks if any substring exists in the target string.
-func contains(s string, substrings ...string) bool {
-	for _, sub := range substrings {
+// containsAny memeriksa apakah ada substring yang cocok.
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
 		if strings.Contains(s, sub) {
 			return true
 		}

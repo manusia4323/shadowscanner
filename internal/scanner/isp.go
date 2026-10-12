@@ -1,8 +1,10 @@
-// Package isp guesses the user's ISP from the public IP address.
-// Only makes ONE outbound HTTPS request (to ipinfo.io or ifconfig.co)
-// and only if not disabled. No local IP, MAC, hostname, or device list
-// is ever sent externally.
-package isp
+// Package scanner menyediakan fungsi pemindaian defensif untuk jaringan lokal.
+// CATATAN PRIVASI: File ini adalah SATU-SATUNYA bagian dari seluruh aplikasi ShadowScanner
+// yang melakukan permintaan keluar (outbound request). Hanya ditujukan untuk memeriksa
+// alamat IP publik dan ISP pengguna. Tidak ada data lokal (IP lokal, MAC, nama host,
+// atau daftar perangkat) yang pernah dikirim ke luar. Fitur ini dapat dinonaktifkan
+// kapan saja dengan menyetel argumen disabled = true.
+package scanner
 
 import (
 	"context"
@@ -10,149 +12,138 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
-// ISPInfo holds public IP and ISP information.
+// ISPInfo menyimpan informasi alamat IP publik dan penyedia internet (ISP) pengguna.
 type ISPInfo struct {
-	PublicIP string // Public IP address
-	ISPName  string // ISP name (e.g., "Telkom Indonesia", "Indihome")
-	ASN      string // Autonomous System Number
-	Country  string // Country code
-	Disabled bool   // True if public IP lookup is disabled
+	PublicIP string // Alamat IP publik pengguna
+	ISPName  string // Nama ISP / Organisasi (misal: "Telkom Indonesia", "Indosat")
+	ASN      string // Autonomous System Number (misal: "AS7713")
+	Country  string // Kode negara (misal: "ID")
+	Disabled bool   // true jika fitur permintaan IP publik dinonaktifkan
 }
 
-// GuessISP fetches the public IP and ISP info from a privacy-friendly endpoint.
-// If disabled is true, returns ISPInfo{Disabled: true} immediately without
-// making any network request.
-// Uses https://ipinfo.io/json or https://ifconfig.co/json with 3s timeout.
-// On any error, returns empty ISPInfo with the error wrapped.
+// GuessISP memeriksa IP publik dan ISP pengguna melalui endpoint privasi eksternal.
+// Jika disabled bernilai true, fungsi langsung mengembalikan ISPInfo{Disabled: true}
+// tanpa melakukan panggilan jaringan sama sekali.
 func GuessISP(ctx context.Context, disabled bool) (ISPInfo, error) {
 	if disabled {
 		return ISPInfo{Disabled: true}, nil
 	}
 
-	// Create HTTP client with 3 second timeout
 	client := &http.Client{
 		Timeout: 3 * time.Second,
 	}
 
-	// Try primary endpoint (ipinfo.io)
-	info, err := fetchFromIPInfo(ctx, client)
+	// Coba endpoint utama (ipinfo.io)
+	info, err := fetchIPInfo(ctx, client)
 	if err == nil {
 		return info, nil
 	}
 
-	// Try fallback endpoint (ifconfig.co)
-	info, err = fetchFromIfConfig(ctx, client)
-	if err == nil {
+	// Fallback ke endpoint alternatif (ifconfig.co) jika endpoint utama gagal
+	info, fallbackErr := fetchIfconfigCo(ctx, client)
+	if fallbackErr == nil {
 		return info, nil
 	}
 
-	// Both failed
-	return ISPInfo{}, fmt.Errorf("failed to fetch ISP info: %w", err)
+	return ISPInfo{}, fmt.Errorf("gagal mendapatkan informasi ISP: %w (fallback: %v)", err, fallbackErr)
 }
 
-// fetchFromIPInfo queries https://ipinfo.io/json
-func fetchFromIPInfo(ctx context.Context, client *http.Client) (ISPInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://ipinfo.io/json", nil)
+// fetchIPInfo mengambil data dari https://ipinfo.io/json
+func fetchIPInfo(ctx context.Context, client *http.Client) (ISPInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://ipinfo.io/json", nil)
 	if err != nil {
-		return ISPInfo{}, fmt.Errorf("create request: %w", err)
+		return ISPInfo{}, err
 	}
-	// Add User-Agent for identification
-	req.Header.Set("User-Agent", "ShadowScanner/1.0")
+	req.Header.Set("User-Agent", "ShadowScanner-Defensive/1.0")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return ISPInfo{}, fmt.Errorf("request failed: %w", err)
+		return ISPInfo{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return ISPInfo{}, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		return ISPInfo{}, fmt.Errorf("status HTTP tidak terduga: %d", resp.StatusCode)
 	}
 
-	var data struct {
-		IP    string `json:"ip"`
-		Org   string `json:"org"`   // e.g., "AS3320 Deutsche Telekom AG"
-		City  string `json:"city"`
-		Region string `json:"region"`
+	var payload struct {
+		IP      string `json:"ip"`
+		Org     string `json:"org"`
 		Country string `json:"country"`
-		ASN    string `json:"asn"`   // Some responses may include ASN separately
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return ISPInfo{}, fmt.Errorf("decode response: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return ISPInfo{}, err
 	}
 
-	// Extract ISP name from org field (typically "AS<number> <ISP name>")
-	ispName := extractISPName(data.Org)
-	asn := extractASN(data.Org)
+	ispName, asn := parseOrgField(payload.Org)
 
 	return ISPInfo{
-		PublicIP: data.IP,
+		PublicIP: payload.IP,
 		ISPName:  ispName,
 		ASN:      asn,
-		Country:  data.Country,
+		Country:  payload.Country,
 		Disabled: false,
 	}, nil
 }
 
-// fetchFromIfConfig queries https://ifconfig.co/json
-func fetchFromIfConfig(ctx context.Context, client *http.Client) (ISPInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://ifconfig.co/json", nil)
+// fetchIfconfigCo mengambil data dari https://ifconfig.co/json
+func fetchIfconfigCo(ctx context.Context, client *http.Client) (ISPInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://ifconfig.co/json", nil)
 	if err != nil {
-		return ISPInfo{}, fmt.Errorf("create request: %w", err)
+		return ISPInfo{}, err
 	}
-	req.Header.Set("User-Agent", "ShadowScanner/1.0")
+	req.Header.Set("User-Agent", "ShadowScanner-Defensive/1.0")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return ISPInfo{}, fmt.Errorf("request failed: %w", err)
+		return ISPInfo{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return ISPInfo{}, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		return ISPInfo{}, fmt.Errorf("status HTTP tidak terduga: %d", resp.StatusCode)
 	}
 
-	var data struct {
-		IP    string `json:"ip"`
-		ISP   string `json:"isp"`   // ISP name
-		ASN   string `json:"asn"`   // ASN if available
-		Country string `json:"country_iso"`
+	var payload struct {
+		IP         string `json:"ip"`
+		ASNOrg     string `json:"asn_org"`
+		ASN        string `json:"asn"`
+		CountryISO string `json:"country_iso"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return ISPInfo{}, fmt.Errorf("decode response: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return ISPInfo{}, err
+	}
+
+	if payload.IP == "" {
+		return ISPInfo{}, errors.New("respons kosong dari ifconfig.co")
 	}
 
 	return ISPInfo{
-		PublicIP: data.IP,
-		ISPName:  data.ISP,
-		ASN:      data.ASN,
-		Country:  data.Country,
+		PublicIP: payload.IP,
+		ISPName:  payload.ASNOrg,
+		ASN:      payload.ASN,
+		Country:  payload.CountryISO,
 		Disabled: false,
 	}, nil
 }
 
-// extractISPName extracts the ISP name from ipinfo.io's "org" field.
-// Example: "AS3320 Deutsche Telekom AG" -> "Deutsche Telekom AG"
-func extractISPName(org string) string {
-	// Format is typically "AS<number> <Name>"
-	parts := strings.SplitN(org, " ", 2)
-	if len(parts) == 2 {
-		return parts[1]
+// parseOrgField memisahkan field "org" ipinfo.io (format: "AS7713 PT Telekomunikasi Indonesia")
+// menjadi nama ISP dan nomor ASN.
+func parseOrgField(org string) (string, string) {
+	org = strings.TrimSpace(org)
+	if org == "" {
+		return "Tidak diketahui", ""
 	}
-	return org
-}
 
-// extractASN extracts the ASN from ipinfo.io's "org" field.
-// Example: "AS3320 Deutsche Telekom AG" -> "3320"
-func extractASN(org string) string {
 	parts := strings.SplitN(org, " ", 2)
-	if len(parts) >= 1 && strings.HasPrefix(parts[0], "AS") {
-		return strings.TrimPrefix(parts[0], "AS")
+	if len(parts) == 2 && strings.HasPrefix(parts[0], "AS") {
+		return parts[1], parts[0]
 	}
-	return ""
+	return org, ""
 }

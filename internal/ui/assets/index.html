@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow">
+    <title>ShadowScanner — Pengawas Jaringan Lokal</title>
+    <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+    <!-- ===== Modal Persetujuan Pengguna (Consent) ===== -->
+    <div id="consent-modal" class="modal-overlay">
+        <div class="modal-card">
+            <div style="font-size:3rem; margin-bottom:0.5rem;">🛡️</div>
+            <h2>Selamat Datang di ShadowScanner</h2>
+            <p>ShadowScanner adalah alat <strong>defensif</strong> yang mengawasi jaringan rumah Anda secara pasif. Sebelum memulai, mungkin ketahui hal-hal berikut:</p>
+            <ul class="consent-list">
+                <li>ShadowScanner <strong>tidak pernah</strong> menyerang, menyuntik paket, atau memalsukan identitas perangkat.</li>
+                <li>Pemindaian terbatas pada subnet lokal Anda sendiri (rentang IP yang sama dengan komputer Anda).</li>
+                <li>Hanya port umum yang diperiksa secara pasif (21, 22, 23, 53, 80, 139, 443, 445, 3389, 8080, 8443).</li>
+                <li>Semua data disimpan secara lokal di komputer Anda — tidak ada data yang dikirim keluar kecuali deteksi ISP opsional (satu permintaan HTTPS aman).</li>
+                <li>Server terikat hanya pada <code>127.0.0.1</code> — tidak ada akses dari luar.</li>
+            </ul>
+            <button id="btn-accept-consent" class="btn btn-primary" style="width:100%; justify-content:center; padding:0.75rem;">
+                Saya Mengerti &amp; Setuju — Mulai Memantau
+            </button>
+        </div>
+    </div>
+
+    <!-- ===== Header ===== -->
+    <header class="app-header">
+        <div class="brand">
+            <span class="brand-logo">🛡️</span>
+            <div>
+                <div class="brand-title">ShadowScanner</div>
+                <div class="brand-subtitle">Pengawas Jaringan Lokal (Defensif)</div>
+            </div>
+        </div>
+        <div class="header-status">
+            <span id="server-status-pill" class="status-pill online">● Server Aktif</span>
+            <span id="scan-status-badge" class="scan-status-badge">📡 Memindai...</span>
+            <button id="btn-toggle-scan" class="btn btn-primary">🔍 Pindai Jaringan</button>
+        </div>
+    </header>
+
+    <!-- ===== Navigasi Tab ===== -->
+    <nav class="nav-bar">
+        <button class="nav-item active" data-tab="overview">🏠 Ringkasan</button>
+        <button class="nav-item" data-tab="devices">📱 Perangkat <span class="nav-badge" id="badge-total-devices"></span></button>
+        <button class="nav-item" data-tab="graph">🌐 Topologi</button>
+        <button class="nav-item" data-tab="floorplan">📐 Denah Lokasi</button>
+        <button class="nav-item" data-tab="alerts">⚠️ Peringatan <span class="nav-badge" id="badge-unread-alerts"></span></button>
+        <button class="nav-item" data-tab="connections">🔌 Koneksi</button>
+        <button class="nav-item" data-tab="history">🕘 Riwayat</button>
+    </nav>
+
+    <!-- ===== Main Content ===== -->
+    <main class="main-content">
+
+        <!-- ===== Tab: Overview / Ringkasan ===== -->
+        <section id="view-overview" class="tab-view active">
+            <div class="stat-grid">
+                <div class="stat-card">
+                    <div class="stat-icon blue">📱</div>
+                    <div class="stat-text">
+                        <div class="stat-label">Total Perangkat Diketahui</div>
+                        <div class="stat-value" id="stat-total-devices">0</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon red">⚠️</div>
+                    <div class="stat-text">
+                        <div class="stat-label">Peringatan Aktif</div>
+                        <div class="stat-value" id="stat-active-alerts">0</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon green">🔌</div>
+                    <div class="stat-text">
+                        <div class="stat-label">Koneksi Jaringan Aktif</div>
+                        <div class="stat-value" id="stat-active-conns">0</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="info-grid">
+                <div class="info-card">
+                    <h3>💻 Komputer Anda (Host)</h3>
+                    <div class="detail-row">
+                        <span class="label">Nama Host</span>
+                        <span class="val" id="self-hostname">-</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="label">Alamat IP Lokal</span>
+                        <span class="val font-mono" id="self-ip">-</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="label">Alamat MAC</span>
+                        <span class="val font-mono" id="self-mac">-</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="label">Gerbang (Gateway)</span>
+                        <span class="val font-mono" id="self-gateway">-</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="label">Sistem Operasi</span>
+                        <span class="val" id="self-os">-</span>
+                    </div>
+                </div>
+
+                <div class="info-card">
+                    <h3>🌐 Info Penyedia Internet (ISP)</h3>
+                    <div class="detail-row">
+                        <span class="label">Nama ISP</span>
+                        <span class="val" id="isp-name">Privasi Aman / Lokal</span>
+                    </div>
+                    <div class="detail-row">
+                        <span class="label">IP Publik</span>
+                        <span class="val font-mono" id="isp-public-ip">-</span>
+                    </div>
+                    <p style="margin-top:0.85rem; font-size:0.78rem; color:var(--text-muted);">
+                        🔒 Deteksi ISP bersifat opsional dan hanya melakukan <strong>satu permintaan HTTPS</strong>. Alamat IP/MAC lokal Anda tidak pernah dikirim.
+                    </p>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📋 Saran Tindakan Keamanan</span>
+                </div>
+                <div id="recommendations-list-container"></div>
+            </div>
+        </section>
+
+        <!-- ===== Tab: Devices / Perangkat ===== -->
+        <section id="view-devices" class="tab-view">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Daftar Perangkat di Jaringan Anda</span>
+                    <input type="text" id="input-search-devices" class="search-input" placeholder="🔍 Cari IP, MAC, nama host...">
+                </div>
+                <div class="filter-row">
+                    <button class="btn-filter-type active" data-type="all">Semua</button>
+                    <button class="btn-filter-type" data-type="Router">Router</button>
+                    <button class="btn-filter-type" data-type="Ponsel">Ponsel</button>
+                    <button class="btn-filter-type" data-type="Laptop">Laptop</button>
+                    <button class="btn-filter-type" data-type="PC">PC</button>
+                    <button class="btn-filter-type" data-type="Printer">Printer</button>
+                    <button class="btn-filter-type" data-type="TV">TV</button>
+                    <button class="btn-filter-type" data-type="Kamera IP">Kamera IP</button>
+                    <button class="btn-filter-type" data-type="IoT">IoT</button>
+                    <button class="btn-filter-type" data-type="Perangkat tidak dikenal">Lainnya</button>
+                </div>
+                <div id="devices-grid-container" class="devices-grid"></div>
+            </div>
+        </section>
+
+        <!-- ===== Tab: Graph / Topologi ===== -->
+        <section id="view-graph" class="tab-view">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🌐 Topologi Radial Jaringan (Berdasarkan Estimasi Jarak)</span>
+                </div>
+                <p style="margin-bottom:0.75rem; color:var(--text-muted); font-size:0.85rem;">
+                    Visualisasi murni SVG. Perangkat diatur menurut perkiraan jarak dari komputer Anda. Klik node perangkat untuk detail.
+                </p>
+                <div class="graph-container">
+                    <div id="radial-graph-container" style="height:550px;"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ===== Tab: Floorplan / Denah Lokasi ===== -->
+        <section id="view-floorplan" class="tab-view">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">📐 Denah Lokasi Perangkat (Interaktif)</span>
+                    <button id="btn-reset-floorplan" class="btn btn-outline btn-sm">↺ Atur Ulang Posisi</button>
+                </div>
+                <p style="margin-bottom:0.75rem; color:var(--text-muted); font-size:0.85rem;">
+                    Seret pin perangkat untuk memetakan posisi perkiraan di rumah Anda. Lokasi disimpan di browser (localStorage).
+                </p>
+                <div class="floorplan-wrapper">
+                    <canvas id="floorplan-canvas"></canvas>
+                </div>
+            </div>
+        </section>
+
+        <!-- ===== Tab: Alerts / Peringatan ===== -->
+        <section id="view-alerts" class="tab-view">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">⚠️ Peringatan Keamanan Jaringan</span>
+                </div>
+                <div id="alerts-empty-state" class="empty-state" style="display:none;">
+                    <div style="font-size:3rem; margin-bottom:0.5rem;">✅</div>
+                    <p>Tidak ada peringatan. Jaringan Anda tampak aman.</p>
+                </div>
+                <div id="alerts-list-container"></div>
+            </div>
+        </section>
+
+        <!-- ===== Tab: Connections / Koneksi Aktif ===== -->
+        <section id="view-connections" class="tab-view">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🔌 Koneksi Jaringan Aktif (Proses Lokal)</span>
+                    <input type="text" id="input-search-conns" class="search-input" placeholder="🔍 Cari proses, IP remote...">
+                </div>
+                <div class="table-wrapper">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Proses</th>
+                                <th>Protokol</th>
+                                <th>Lokal</th>
+                                <th>Remote</th>
+                                <th>Status</th>
+                                <th>Dilihat</th>
+                            </tr>
+                        </thead>
+                        <tbody id="conns-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- ===== Tab: History / Riwayat ===== -->
+        <section id="view-history" class="tab-view">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">🕘 Riwayat Pemindaian</span>
+                </div>
+                <div class="table-wrapper">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Mulai</th>
+                                <th>Selesai</th>
+                                <th>Perangkat</th>
+                                <th>Peringatan</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">⚙️ Pengaturan Aplikasi</span>
+                </div>
+                <div class="settings-row">
+                    <div class="settings-label">
+                        <strong>Durasi Retensi Data</strong>
+                        <small>Berapa lama riwayat dipertahankan sebelum dibersihkan otomatis (1-720 jam).</small>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:0.75rem;">
+                        <input type="range" id="range-retention-hours" min="1" max="720" value="8">
+                        <span id="label-retention-hours" class="font-mono" style="min-width:80px; text-align:right;">8 jam</span>
+                    </div>
+                </div>
+                <div class="settings-row">
+                    <div class="settings-label">
+                        <strong>Mode Peringatan Santai</strong>
+                        <small>Matikan untuk mengikuti sinyal keamanan yang lebih ketat (disarankan untuk pemula).</small>
+                    </div>
+                    <input type="checkbox" id="toggle-warning-mode" class="toggle-switch">
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- ===== Modal: Detail Perangkat ===== -->
+    <div id="device-modal" class="modal-overlay device-modal">
+        <div class="modal-card" style="max-width:520px; text-align:left;">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.5rem;">
+                <span style="color:var(--text-muted); font-size:0.85rem;">Detail Perangkat</span>
+                <button id="btn-close-device-modal" class="btn btn-sm btn-outline">&times; Tutup</button>
+            </div>
+            <div id="device-modal-body"></div>
+        </div>
+    </div>
+
+    <!-- ===== Scripts ===== -->
+    <script src="/assets/js/i18n.js"></script>
+    <script src="/assets/js/api.js"></script>
+    <script src="/assets/js/alerts.js"></script>
+    <script src="/assets/js/graph.js"></script>
+    <script src="/assets/js/floorplan.js"></script>
+    <script src="/assets/js/app.js"></script>
+</body>
+</html>

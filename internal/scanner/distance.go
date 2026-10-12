@@ -1,43 +1,46 @@
-// Package distance estimates the rough distance between the user's device
-// and each discovered device, using the best available signal.
-// Estimates are always labeled as "perkiraan" (estimate) and confidence
-// is categorized as "rendah", "sedang", or "tinggi".
-package distance
+// Package scanner menyediakan fungsi pemindaian defensif untuk jaringan lokal.
+package scanner
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"math"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 )
 
-// DistanceEstimate holds the estimated distance to a device.
+// DistanceEstimate merekam perkiraan jarak fisik antara mesin pengguna dan perangkat lain.
 type DistanceEstimate struct {
-	Meters     float64 // Estimated distance in meters
-	Confidence string  // "rendah" | "sedang" | "tinggi"
-	Method     string  // "CSI" | "RSSI" | "tidak diketahui"
+	Meters     float64 // Perkiraan jarak dalam satuan meter
+	Confidence string  // Tingkat keyakinan: "rendah" | "sedang" | "tinggi"
+	Method     string  // Metode yang digunakan: "CSI" | "RSSI" | "tidak diketahui"
 }
 
-// Estimate attempts to determine distance using the best available method.
-// Priority: 1. CSI (Channel State Information), 2. RSSI from OS WiFi API,
-// 3. "tidak diketahui" with low confidence.
+// Estimate memperkirakan jarak kasar dari pengguna ke perangkat target secara read-only.
+// Selalu diberi label perkiraan dan tidak pernah mengklaim akurasi mutlak.
 func Estimate(ctx context.Context, dev Device) DistanceEstimate {
-	// Method 1: CSI (Channel State Information)
-	// Check if Linux WiFi interface exposes CSI via nexmon or iwlwifi
-	// This requires patched drivers and is optional.
-	if csiEst := tryCSI(ctx); csiEst != nil {
-		return *csiEst
+	select {
+	case <-ctx.Done():
+		return DistanceEstimate{
+			Meters:     0,
+			Confidence: "rendah",
+			Method:     "tidak diketahui",
+		}
+	default:
 	}
 
-	// Method 2: RSSI from OS WiFi API
-	if rssiEst := tryRSSI(ctx); rssiEst != nil {
-		return *rssiEst
+	// 1. Prioritas 1: CSI (Channel State Information) jika driver WiFi mendukung.
+	if csi, ok := tryEstimateCSI(ctx, dev); ok {
+		return csi
 	}
 
-	// Method 3: Unknown
+	// 2. Prioritas 2: RSSI (Received Signal Strength Indicator) dari API nirkabel OS.
+	if rssi, ok := tryEstimateRSSI(ctx, dev); ok {
+		return rssi
+	}
+
+	// 3. Fallback jika tidak tersedia sinyal radio nirkabel.
 	return DistanceEstimate{
 		Meters:     0,
 		Confidence: "rendah",
@@ -45,210 +48,127 @@ func Estimate(ctx context.Context, dev Device) DistanceEstimate {
 	}
 }
 
-// tryCSI attempts to read CSI data from Linux WiFi interface.
-// Returns nil if CSI is not available (requires patched driver).
-func tryCSI(ctx context.Context) *DistanceEstimate {
-	// CSI requires specific hardware and patched drivers (nexmon, iwlwifi-csi).
-	// On standard systems, this is not available.
-	// We check for common CSI interfaces like /proc/net/wireless or debugfs.
-	// For this session, we return nil to indicate CSI is unavailable.
-	// Future sessions can implement actual CSI reading if needed.
-	return nil
+// tryEstimateCSI memeriksa ketersediaan data Channel State Information (membutuhkan driver nexmon/iwlwifi khusus).
+func tryEstimateCSI(ctx context.Context, dev Device) (DistanceEstimate, bool) {
+	// Pada sistem operasi standar tanpa driver modifikasi, CSI tidak tersedia.
+	// Dipertahankan sebagai placeholder arsitektural untuk Session/v2.
+	return DistanceEstimate{}, false
 }
 
-// tryRSSI attempts to get signal strength (RSSI) from the OS WiFi API.
-// Linux: `iw dev <iface> station dump` → parse "signal:" field
-// Windows: `netsh wlan show interfaces` → parse "Signal"
-// Converts RSSI (dBm) to meters using log-distance path loss model.
-// Returns nil if RSSI cannot be obtained.
-func tryRSSI(ctx context.Context) *DistanceEstimate {
-	// Try Linux first
-	if est := tryRSSILinux(); est != nil {
-		return est
+// tryEstimateRSSI membaca kekuatan sinyal WiFi dari perintah sistem operasi secara read-only.
+func tryEstimateRSSI(ctx context.Context, dev Device) (DistanceEstimate, bool) {
+	switch runtime.GOOS {
+	case "linux":
+		return estimateRSSILinux(ctx, dev.MAC)
+	case "windows":
+		return estimateRSSIWindows(ctx)
+	default:
+		return DistanceEstimate{}, false
 	}
-	// Try Windows
-	if est := tryRSSIWindows(); est != nil {
-		return est
-	}
-	// macOS support could be added later
-	return nil
 }
 
-// tryRSSILinux runs `iw dev <iface> station dump` and parses signal strength.
-// Returns nil if command fails or no signal found.
-func tryRSSILinux() *DistanceEstimate {
-	// Get default WiFi interface (typically wlan0, wlp2s0, etc.)
-	// We'll try to find a wireless interface
-	iface := getLinuxWifiInterface()
-	if iface == "" {
-		return nil
-	}
-
-	// Run iw dev <iface> station dump
-	cmd := exec.Command("iw", "dev", iface, "station", "dump")
-	output, err := cmd.Output()
+// estimateRSSILinux membaca `iw dev <iface> station dump` dan mengurai nilai "signal:".
+func estimateRSSILinux(ctx context.Context, targetMAC string) (DistanceEstimate, bool) {
+	out, err := exec.CommandContext(ctx, "iw", "dev").Output()
 	if err != nil {
-		return nil
+		return DistanceEstimate{}, false
 	}
 
-	// Parse output for "signal:" field (in dBm)
-	// Example output:
-	// Station aa:bb:cc:dd:ee:ff (on wlan0)
-	//         signal: -45 dBm
-	//         signal avg: -42 dBm
-	lines := strings.Split(string(output), "\n")
-	var rssi int
+	// Cari antarmuka nirkabel pertama dari keluaran `iw dev`
+	var iface string
+	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "signal:") {
-			// Format: "signal: -45 dBm"
-			parts := strings.Fields(line)
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Interface ") {
+			parts := strings.Fields(trimmed)
 			if len(parts) >= 2 {
-				rssiStr := strings.TrimSuffix(parts[1], "dBm")
-				rssiStr = strings.TrimSpace(rssiStr)
-				if val, err := strconv.Atoi(rssiStr); err == nil {
-					rssi = val
-					break
-				}
+				iface = parts[1]
+				break
 			}
 		}
 	}
 
-	if rssi == 0 {
-		// If signal not found (maybe not connected), try average signal
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "signal avg:") {
-				parts := strings.Fields(line)
-				if len(parts) >= 3 {
-					rssiStr := strings.TrimSuffix(parts[2], "dBm")
-					rssiStr = strings.TrimSpace(rssiStr)
-					if val, err := strconv.Atoi(rssiStr); err == nil {
-						rssi = val
-						break
+	if iface == "" {
+		return DistanceEstimate{}, false
+	}
+
+	// Eksekusi `iw dev <iface> station dump`
+	dumpOut, err := exec.CommandContext(ctx, "iw", "dev", iface, "station", "dump").Output()
+	if err != nil {
+		return DistanceEstimate{}, false
+	}
+
+	dumpLines := strings.Split(string(dumpOut), "\n")
+	var currentStation string
+	for _, l := range dumpLines {
+		trimmed := strings.TrimSpace(l)
+		if strings.HasPrefix(trimmed, "Station ") {
+			parts := strings.Fields(trimmed)
+			if len(parts) >= 2 {
+				currentStation = strings.ToUpper(parts[1])
+			}
+		} else if strings.HasPrefix(trimmed, "signal:") {
+			// Jika station cocok dengan target MAC atau jika targetMAC kosong ambil station pertama
+			if targetMAC == "" || strings.EqualFold(currentStation, targetMAC) {
+				fields := strings.Fields(trimmed)
+				if len(fields) >= 2 {
+					valStr := strings.TrimSuffix(fields[1], "dBm")
+					val, convErr := strconv.Atoi(strings.TrimSpace(valStr))
+					if convErr == nil && val < 0 {
+						return calculateLogDistance(float64(val), "RSSI"), true
 					}
 				}
 			}
 		}
 	}
 
-	if rssi == 0 {
-		return nil
-	}
-
-	// Convert RSSI to distance using log-distance path loss model
-	// d = 10 ^ ((TxPower - RSSI) / (10 * n))
-	// TxPower = -30 dBm (typical at 1m)
-	// n = 2.7 (indoor path loss exponent)
-	txPower := -30.0
-	n := 2.7
-	distance := math.Pow(10, (txPower-float64(rssi))/(10.0*n))
-
-	// Confidence: "sedang" if RSSI between -30 and -80 dBm, else "rendah"
-	confidence := "sedang"
-	if rssi < -80 || rssi > -30 {
-		confidence = "rendah"
-	}
-
-	return &DistanceEstimate{
-		Meters:     distance,
-		Confidence: confidence,
-		Method:     "RSSI",
-	}
+	return DistanceEstimate{}, false
 }
 
-// getLinuxWifiInterface attempts to find a wireless interface name.
-// Returns the first interface that appears to be wireless.
-func getLinuxWifiInterface() string {
-	// Read /proc/net/wireless for wireless interfaces
-	data, err := exec.Command("cat", "/proc/net/wireless").Output()
+// estimateRSSIWindows membaca persentase sinyal dari `netsh wlan show interfaces`.
+func estimateRSSIWindows(ctx context.Context) (DistanceEstimate, bool) {
+	out, err := exec.CommandContext(ctx, "netsh", "wlan", "show", "interfaces").Output()
 	if err != nil {
-		return ""
-	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "Inter-|") || strings.HasPrefix(line, "face") {
-			continue
-		}
-		// Format: wlan0:   0000   32.  -45.  -256
-		parts := strings.Fields(line)
-		if len(parts) > 0 {
-			// Remove trailing colon
-			iface := strings.TrimSuffix(parts[0], ":")
-			return iface
-		}
-	}
-	return ""
-}
-
-// tryRSSIWindows runs `netsh wlan show interfaces` and parses Signal strength.
-// Returns nil if command fails or no signal found.
-func tryRSSIWindows() *DistanceEstimate {
-	cmd := exec.Command("netsh", "wlan", "show", "interfaces")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil
+		return DistanceEstimate{}, false
 	}
 
-	// Parse output for "Signal" field
-	// Example: "Signal                 : 80%"
-	lines := strings.Split(string(output), "\n")
-	var signalPercent int
+	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
 		if strings.Contains(line, "Signal") && strings.Contains(line, ":") {
 			parts := strings.Split(line, ":")
 			if len(parts) >= 2 {
-				valStr := strings.TrimSpace(parts[1])
-				valStr = strings.TrimSuffix(valStr, "%")
-				valStr = strings.TrimSpace(valStr)
-				if val, err := strconv.Atoi(valStr); err == nil {
-					signalPercent = val
-					break
+				valStr := strings.TrimSpace(strings.ReplaceAll(parts[1], "%", ""))
+				pct, err := strconv.Atoi(valStr)
+				if err == nil && pct > 0 {
+					// Konversi perkiraan persentase ke dBm: 100% -> -50 dBm, 0% -> -100 dBm
+					rssi := -100.0 + (float64(pct) * 0.5)
+					return calculateLogDistance(rssi, "RSSI"), true
 				}
 			}
 		}
 	}
+	return DistanceEstimate{}, false
+}
 
-	if signalPercent == 0 {
-		return nil
-	}
-
-	// Convert signal percentage to approximate dBm
-	// Windows signal % mapping: 0% ~ -100 dBm, 100% ~ -50 dBm (rough approximation)
-	// Linear mapping: dBm = -100 + signal% * 0.5
-	// But this is very approximate. Better: use standard mapping.
-	// Common mapping: -100 dBm = 0%, -90 = 10%, -80 = 30%, -70 = 50%, -60 = 70%, -50 = 100%
-	// We'll use a simple piecewise linear approximation
-	var rssi int
-	if signalPercent >= 100 {
-		rssi = -50
-	} else if signalPercent >= 80 {
-		rssi = -60
-	} else if signalPercent >= 60 {
-		rssi = -70
-	} else if signalPercent >= 40 {
-		rssi = -80
-	} else if signalPercent >= 20 {
-		rssi = -90
-	} else {
-		rssi = -100
-	}
-
-	// Convert RSSI to distance
+// calculateLogDistance mengonversi nilai RSSI (dBm) ke meter menggunakan log-distance path loss model:
+// d = 10 ^ ((TxPower - RSSI) / (10 * n))
+// dengan TxPower = -30 dBm dan n = 2.7 (lingkungan dalam ruangan).
+func calculateLogDistance(rssi float64, method string) DistanceEstimate {
 	txPower := -30.0
 	n := 2.7
-	distance := math.Pow(10, (txPower-float64(rssi))/(10.0*n))
+
+	exponent := (txPower - rssi) / (10.0 * n)
+	meters := math.Pow(10, exponent)
+	meters = math.Round(meters*10) / 10 // bulatkan 1 desimal
 
 	confidence := "sedang"
 	if rssi < -80 || rssi > -30 {
 		confidence = "rendah"
 	}
 
-	return &DistanceEstimate{
-		Meters:     distance,
+	return DistanceEstimate{
+		Meters:     meters,
 		Confidence: confidence,
-		Method:     "RSSI",
+		Method:     method,
 	}
 }

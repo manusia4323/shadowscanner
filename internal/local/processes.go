@@ -1,13 +1,15 @@
-// Package processes menyediakan daftar proses yang saat ini membuka
+// Package local menyediakan daftar proses yang saat ini membuka
 // koneksi jaringan, dalam bahasa Indonesia yang mudah dipahami.
 package local
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"sort"
 
-	"github.com/shirou/gopsutil/v4/process"
-	"github.com/shirou/gopsutil/v4/net"
+	"github.com/shirou/gopsutil/v3/net"
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 // ProcNetInfo merekam informasi tentang satu proses yang membuka koneksi jaringan.
@@ -22,90 +24,79 @@ type ProcNetInfo struct {
 // ListNetworkProcesses mengembalikan daftar proses yang saat ini membuka
 // koneksi TCP, diurutkan dari yang paling banyak koneksi ke yang paling sedikit.
 //
-// Fungsi ini read-only: tidak pernah membunuh, menyuspend, atau memodifikasi
-// proses apa pun, dan tidak pernah membaca memori proses.
+// Fungsi ini bersifat read-only: tidak pernah membunuh, menghentikan, atau
+// memodifikasi proses apa pun, dan tidak pernah membaca memori proses.
 func ListNetworkProcesses(ctx context.Context) ([]ProcNetInfo, error) {
-	// Dapatkan semua koneksi TCP
-	tcpConns, err := net.ConnectionsWithContext(ctx, "tcp")
+	conns, err := net.ConnectionsWithContext(ctx, "tcp")
 	if err != nil {
-		return nil, fmt.Errorf("get TCP connections: %w", err)
+		return nil, fmt.Errorf("gagal membaca koneksi TCP: %w", err)
 	}
 
 	// Kelompokkan koneksi berdasarkan PID
-	type pidInfo struct {
-		pids        []int
-		remoteIPs   map[string]struct{}
+	type procData struct {
+		remoteSet map[string]struct{}
+		count     int
 	}
-	byPID := make(map[int]*pidInfo)
-	for _, c := range tcpConns {
-		if c.Pid == 0 {
+
+	byPID := make(map[int]*procData)
+	for _, c := range conns {
+		pid := int(c.Pid)
+		if pid <= 0 {
 			continue
 		}
-		info, ok := byPID[int(c.Pid)]
+
+		pd, ok := byPID[pid]
 		if !ok {
-			info = &pidInfo{remoteIPs: make(map[string]struct{})}
-			byPID[int(c.Pid)] = info
+			pd = &procData{remoteSet: make(map[string]struct{})}
+			byPID[pid] = pd
 		}
-		info.pids = append(info.pids, int(c.Pid))
-		if c.Raddr.IP != "" && c.Raddr.IP != "0.0.0.0" && c.Raddr.IP != "::1" && c.Raddr.IP != "127.0.0.1" {
-			info.remoteIPs[c.Raddr.IP] = struct{}{}
+		pd.count++
+
+		remoteIP := c.Raddr.IP
+		if remoteIP != "" && remoteIP != "0.0.0.0" && remoteIP != "::" && remoteIP != "127.0.0.1" && remoteIP != "::1" {
+			pd.remoteSet[remoteIP] = struct{}{}
 		}
 	}
 
-	// Gabungkan PID duplikat dan ambil info proses
-	var result []ProcNetInfo
-	for pid, info := range byPID {
-		// Ambil info proses untuk PID pertama (semua PID duplikat adalah proses yang sama)
-		p, err := process.NewProcess(int64(pid))
-		if err != nil {
-			// Ijin rendah: catat di log dan lanjutkan, jangan gagal
-			slog.Warn("tidak dapat mengambil info proses (mungkin butuh izin)", "pid", pid, "error", err)
-			continue
-		}
-
-		// Gabungkan semua executable path dari PID duplikat
-		var exePaths []string
-		seen := make(map[string]struct{})
-		for _, pids := range info.pids {
-			pp, err := process.NewProcess(int64(pids))
-			if err != nil {
-				continue
-			}
-			if pe, err := pp.Exe(); err == nil && pe != "" {
-				if _, ok := seen[pe]; !ok {
-					seen[pe] = struct{}{}
-					exePaths = append(exePaths, pe)
-				}
-			}
-		}
-		exe := ""
-		if len(exePaths) > 0 {
-			exe = exePaths[0]
-		}
-
+	results := make([]ProcNetInfo, 0, len(byPID))
+	for pid, pd := range byPID {
 		name := "Tidak diketahui"
-		if n, err := p.Name(); err == nil && n != "" {
-			name = n
+		exe := ""
+
+		p, err := process.NewProcessWithContext(ctx, int32(pid))
+		if err == nil {
+			if n, err := p.NameWithContext(ctx); err == nil && n != "" {
+				name = n
+			}
+			if e, err := p.ExeWithContext(ctx); err == nil && e != "" {
+				exe = e
+			}
+		} else {
+			slog.Debug("izin terbatas saat membaca proses", "pid", pid, "error", err)
 		}
 
-		hostList := make([]string, 0, len(info.remoteIPs))
-		for ip := range info.remoteIPs {
-			hostList = append(hostList, ip)
+		hosts := make([]string, 0, len(pd.remoteSet))
+		for h := range pd.remoteSet {
+			hosts = append(hosts, h)
 		}
+		sort.Strings(hosts)
 
-		result = append(result, ProcNetInfo{
+		results = append(results, ProcNetInfo{
 			PID:         pid,
 			Name:        name,
 			Exe:         exe,
-			Connections: len(info.pids),
-			RemoteHosts: hostList,
+			Connections: pd.count,
+			RemoteHosts: hosts,
 		})
 	}
 
-	// Urutkan dari koneksi terbanyak ke sedikit
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Connections > result[j].Connections
+	// Urutkan dari jumlah koneksi terbanyak ke paling sedikit
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Connections != results[j].Connections {
+			return results[i].Connections > results[j].Connections
+		}
+		return results[i].PID < results[j].PID
 	})
 
-	return result, nil
+	return results, nil
 }

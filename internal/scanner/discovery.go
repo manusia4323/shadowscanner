@@ -1,547 +1,516 @@
-// Package discovery implements passive network discovery for devices on the
-// local subnet. It uses ARP table reading, ICMP probing, and hostname
-// resolution to build a list of devices without injecting malicious traffic.
-package discovery
+// Package scanner menyediakan fungsi pemindaian defensif untuk jaringan lokal:
+// penemuan perangkat (discovery), pemeriksaan port terbatas, sidik jari (fingerprinting),
+// perkiraan jarak fisik, dan identifikasi penyedia layanan internet (ISP).
+package scanner
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"os"
 	"os/exec"
-	"strconv"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"shadowscanner/internal/config"
 )
 
-// Device represents a discovered device on the local network.
+// Device merepresentasikan satu perangkat yang terdeteksi di jaringan lokal pengguna.
 type Device struct {
-	MAC      string
-	IP       string
-	Hostname string
-	Vendor   string
+	MAC      string // Alamat MAC (format XX:XX:XX:XX:XX:XX)
+	IP       string // Alamat IPv4 lokal
+	Hostname string // Nama host dari reverse DNS atau mDNS
+	Vendor   string // Nama pabrikan dari prefix OUI
 }
 
-// Discovery manages the discovery process using configuration.
+// Discovery mengelola proses pemindaian dan penemuan perangkat pada subnet lokal pengguna.
 type Discovery struct {
 	cfg *config.Config
 }
 
-// NewDiscovery creates a new Discovery instance with the given config.
+// NewDiscovery menciptakan instance Discovery baru dengan konfigurasi yang diberikan.
 func NewDiscovery(cfg *config.Config) (*Discovery, error) {
 	if cfg == nil {
-		return nil, errors.New("config is required")
+		return nil, errors.New("konfigurasi tidak boleh nil")
 	}
 	return &Discovery{cfg: cfg}, nil
 }
 
-// Scan performs a single discovery sweep and returns found devices.
-// It respects the provided context for cancellation.
+// subnetInterface menyimpan informasi antarmuka aktif dan subnet-nya.
+type subnetInterface struct {
+	iface   net.Interface
+	ip      net.IP
+	mac     string
+	ipNet   *net.IPNet
+	network net.IP
+}
+
+// Scan melakukan pemindaian pasif pada subnet lokal dan mengembalikan daftar perangkat.
+// Seluruh operasi mematuhi pembatalan melalui context.Context.
 func (d *Discovery) Scan(ctx context.Context) ([]Device, error) {
-	// 1. Determine user's own IP, MAC, and subnet for each active non-loopback interface.
-	interfaces, err := net.Interfaces()
+	slog.Debug("memulai pemindaian jaringan lokal pasif")
+
+	// 1. Dapatkan antarmuka aktif non-loopback dan subnet lokalnya.
+	subnets, err := getLocalSubnets()
 	if err != nil {
-		return nil, fmt.Errorf("list interfaces: %w", err)
+		return nil, fmt.Errorf("gagal mendapatkan subnet lokal: %w", err)
+	}
+	if len(subnets) == 0 {
+		return nil, errors.New("tidak ada antarmuka jaringan aktif yang memiliki alamat IPv4")
 	}
 
-	var localAddrs []interfaceAddr
+	// 2. Baca tabel ARP awal.
+	initialARP, err := readARPTable()
+	if err != nil {
+		slog.Debug("baca tabel ARP awal menemui kendala, melanjutkan", "error", err)
+		initialARP = nil
+	}
+
+	// 3. Kirim probe ICMP echo tunggal (1 paket) ke host di subnet untuk memicu cache ARP.
+	// Batasi konkuren maksimal 32 goroutine.
+	if err := d.probeSubnets(ctx, subnets); err != nil {
+		return nil, fmt.Errorf("probe subnet dibatalkan: %w", err)
+	}
+
+	// 4. Baca ulang tabel ARP untuk mengumpulkan perangkat yang baru terdeteksi.
+	updatedARP, err := readARPTable()
+	if err != nil && len(initialARP) == 0 {
+		return nil, fmt.Errorf("baca ulang tabel ARP gagal: %w", err)
+	}
+
+	// Gabungkan entri ARP yang unik berdasarkan MAC.
+	arpMap := make(map[string]string) // MAC -> IP
+	for _, entry := range initialARP {
+		if entry.mac != "" && entry.ip != "" {
+			arpMap[strings.ToUpper(entry.mac)] = entry.ip
+		}
+	}
+	for _, entry := range updatedARP {
+		if entry.mac != "" && entry.ip != "" {
+			arpMap[strings.ToUpper(entry.mac)] = entry.ip
+		}
+	}
+
+	// 5. Kumpulkan daftar perangkat sendiri untuk dilewati dari hasil.
+	selfMACs := make(map[string]bool)
+	selfIPs := make(map[string]bool)
+	for _, s := range subnets {
+		selfMACs[strings.ToUpper(s.mac)] = true
+		selfIPs[s.ip.String()] = true
+	}
+
+	// 6. Resolusi hostname dan pabrikan vendor untuk setiap perangkat yang ditemukan.
+	var devices []Device
+	for mac, ipStr := range arpMap {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		// Lewati alamat broadcast atau zero MAC
+		if isIgnoredMAC(mac) {
+			continue
+		}
+
+		// Lewati perangkat milik pengguna sendiri
+		if selfMACs[mac] || selfIPs[ipStr] {
+			continue
+		}
+
+		// Pastikan IP perangkat berada dalam salah satu subnet lokal pengguna
+		targetIP := net.ParseIP(ipStr)
+		if targetIP == nil || !isIPInSubnets(targetIP, subnets) {
+			continue
+		}
+
+		// Resolusi hostname dengan batas waktu 1 detik
+		hostname := resolveHostname(ctx, ipStr)
+
+		// Lookup vendor dari MAC OUI
+		vendor := LookupVendor(mac)
+
+		devices = append(devices, Device{
+			MAC:      mac,
+			IP:       ipStr,
+			Hostname: hostname,
+			Vendor:   vendor,
+		})
+	}
+
+	slog.Debug("pemindaian jaringan selesai", "total_perangkat", len(devices))
+	return devices, nil
+}
+
+// Self mengembalikan informasi tentang perangkat pengguna sendiri (IP, MAC, hostname).
+func (d *Discovery) Self() (Device, error) {
+	hostname, _ := os.Hostname()
+	subnets, err := getLocalSubnets()
+	if err != nil || len(subnets) == 0 {
+		return Device{}, errors.New("tidak dapat menemukan antarmuka aktif untuk perangkat sendiri")
+	}
+
+	primary := subnets[0]
+	return Device{
+		MAC:      strings.ToUpper(primary.mac),
+		IP:       primary.ip.String(),
+		Hostname: hostname,
+		Vendor:   LookupVendor(primary.mac),
+	}, nil
+}
+
+// getLocalSubnets mengumpulkan semua antarmuka non-loopback yang aktif beserta subnet IPv4-nya.
+func getLocalSubnets() ([]subnetInterface, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	var result []subnetInterface
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
-			continue // skip loopback and down interfaces
+			continue
 		}
+
 		addrs, err := iface.Addrs()
 		if err != nil {
-			continue // skip interface if we can't read addresses
+			continue
 		}
+
 		for _, addr := range addrs {
 			var ip net.IP
+			var ipNet *net.IPNet
 			switch v := addr.(type) {
 			case *net.IPNet:
 				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
+				ipNet = v
 			}
-			if ip == nil || ip.IsLoopback() {
+
+			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
 				continue
 			}
-			if ip.To4() == nil {
-				continue // IPv4 only for now
-			}
+
 			mac := iface.HardwareAddr.String()
-			if len(mac) == 0 {
-				continue
-			}
-			// Assume /24 subnet for simplicity — common for local networks.
-			// The IP's network portion with a /24 mask gives us the subnet base.
-			mask := net.CIDRMask(24, 32)
-			network := ip.Mask(mask)
-			localAddrs = append(localAddrs, interfaceAddr{
-				iface:  iface,
-				ip:     ip,
-				mac:    mac,
+			network := ip.Mask(ipNet.Mask)
+
+			result = append(result, subnetInterface{
+				iface:   iface,
+				ip:      ip,
+				mac:     mac,
+				ipNet:   ipNet,
 				network: network,
 			})
 		}
 	}
+	return result, nil
+}
 
-	if len(localAddrs) == 0 {
-		return nil, errors.New("no suitable network interfaces found")
-	}
-
-	// 2. Read ARP table for each interface to get initial neighbor cache.
-	arpEntries, err := readARPTable()
-	if err != nil {
-		return nil, fmt.Errorf("read ARP table: %w", err)
-	}
-
-	// 3. For each local interface, send ICMP echo to each host in subnet to populate ARP.
+// probeSubnets mengirimkan 1 paket ICMP echo ke host dalam subnet untuk memperbarui cache ARP.
+func (d *Discovery) probeSubnets(ctx context.Context, subnets []subnetInterface) error {
+	sem := make(chan struct{}, 32)
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 32) // limit concurrency to 32 goroutines
-	discovered := make(map[string]Device) // keyed by MAC
-	var mu sync.Mutex
 
-	for _, local := range localAddrs {
-		// Generate list of IPs in subnet (excluding .0 and .255)
-		for i := 1; i < 255; i++ {
-			targetIP := make(net.IP, 4)
-			copy(targetIP, local.network)
-			targetIP[3] += byte(i)
-			// Skip the user's own IP
-			if targetIP.Equal(local.ip) {
+	for _, sub := range subnets {
+		// Dapatkan daftar target IP (batasi mask untuk mencegah pemindaian terlalu luas di luar /24)
+		targets := generateSubnetIPs(sub)
+
+		for _, target := range targets {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			// Lewati IP pengguna sendiri
+			if target.Equal(sub.ip) {
 				continue
 			}
+
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+
 			wg.Add(1)
 			go func(ip net.IP) {
-				defer wg.Done()
-				// Send single ICMP echo with 500 ms timeout
-				if err := pingHostIP(ip, 500*time.Millisecond); err != nil {
-					// Ignore errors; host may be down or not responding
-					return
-				}
-			}(targetIP)
+				defer func() {
+					<-sem
+					wg.Done()
+				}()
+
+				pingCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+				defer cancel()
+
+				_ = pingSingleHost(pingCtx, ip)
+			}(target)
 		}
 	}
-	wg.Wait() // wait for all pings to complete
 
-	// 4. Re-read ARP table to get newly populated entries.
-	newARP, err := readARPTable()
-	if err != nil {
-		return nil, fmt.Errorf("re-read ARP table: %w", err)
+	wg.Wait()
+	return nil
+}
+
+// generateSubnetIPs menghasilkan daftar IP pada subnet (biasanya 1..254 untuk /24).
+func generateSubnetIPs(sub subnetInterface) []net.IP {
+	var ips []net.IP
+	ones, bits := sub.ipNet.Mask.Size()
+	// Jika subnet lebih besar dari /24 (misal /16 atau /8), batasi ke rentang /24 lokal IP pengguna
+	// demi kepatuhan etis (hanya mengamati lingkungan terdekat).
+	if ones < 24 && bits == 32 {
+		baseIP := make(net.IP, 4)
+		copy(baseIP, sub.ip.To4())
+		baseIP[3] = 0 // Ubah menjadi X.X.X.0/24
+		for i := 1; i < 255; i++ {
+			ip := make(net.IP, 4)
+			copy(ip, baseIP)
+			ip[3] = byte(i)
+			ips = append(ips, ip)
+		}
+		return ips
 	}
-	// Merge existing and new ARP entries
-	merged := make(map[string]bool)
-	for _, e := range arpEntries {
-		merged[e.mac] = true
+
+	// Untuk subnet /24 atau lebih kecil
+	baseIP := sub.ip.To4()
+	if baseIP == nil {
+		return nil
 	}
-	for _, e := range newARP {
-		merged[e.mac] = true
+
+	for i := 1; i < 255; i++ {
+		ip := make(net.IP, 4)
+		copy(ip, baseIP)
+		ip[3] = byte(i)
+		ips = append(ips, ip)
 	}
-	var mergedEntries []arpEntry
-	for mac := range merged {
-		// Find the entry with this MAC
-		for _, e := range arpEntries {
-			if e.mac == mac {
-				mergedEntries = append(mergedEntries, e)
-				break
+	return ips
+}
+
+// pingSingleHost mengirim 1 paket ping ringan ke host.
+func pingSingleHost(ctx context.Context, ip net.IP) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.CommandContext(ctx, "ping", "-n", "1", "-w", "500", ip.String())
+	case "darwin":
+		cmd = exec.CommandContext(ctx, "ping", "-c", "1", "-W", "500", ip.String())
+	default: // Linux
+		cmd = exec.CommandContext(ctx, "ping", "-c", "1", "-W", "1", ip.String())
+	}
+	return cmd.Run()
+}
+
+// arpItem menyimpan pasangan IP dan MAC.
+type arpItem struct {
+	ip  string
+	mac string
+}
+
+// readARPTable membaca entri tabel ARP dari sistem operasi.
+func readARPTable() ([]arpItem, error) {
+	switch runtime.GOOS {
+	case "linux":
+		return readARPTableLinux()
+	case "windows":
+		return readARPTableWindows()
+	case "darwin":
+		return readARPTableDarwin()
+	default:
+		return readARPTableLinux()
+	}
+}
+
+// readARPTableLinux membaca /proc/net/arp atau perintah ip neigh.
+func readARPTableLinux() ([]arpItem, error) {
+	// Cara 1: langsung baca file /proc/net/arp (sangat cepat & tanpa dependensi eksternal)
+	if data, err := os.ReadFile("/proc/net/arp"); err == nil {
+		lines := strings.Split(string(data), "\n")
+		var items []arpItem
+		for _, line := range lines[1:] {
+			fields := strings.Fields(line)
+			if len(fields) >= 4 {
+				ip := fields[0]
+				hwType := fields[1]
+				mac := strings.ToUpper(fields[3])
+				if hwType == "0x1" && mac != "00:00:00:00:00:00" && len(mac) == 17 {
+					items = append(items, arpItem{ip: ip, mac: mac})
+				}
 			}
 		}
-		for _, e := range newARP {
-			if e.mac == mac {
-				// Already added if from arpEntries; skip duplicate
-				// Actually we want unique entries - take first seen
-				added := false
-				for _, me := range mergedEntries {
-					if me.mac == mac {
-						added = true
+		if len(items) > 0 {
+			return items, nil
+		}
+	}
+
+	// Cara 2: fallback ke perintah `ip neigh`
+	if out, err := exec.Command("ip", "neigh").Output(); err == nil {
+		lines := strings.Split(string(out), "\n")
+		var items []arpItem
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) >= 5 {
+				ip := fields[0]
+				for i, f := range fields {
+					if f == "lladdr" && i+1 < len(fields) {
+						mac := strings.ToUpper(fields[i+1])
+						if mac != "00:00:00:00:00:00" && len(mac) == 17 {
+							items = append(items, arpItem{ip: ip, mac: mac})
+						}
 						break
 					}
 				}
-				if !added {
-					mergedEntries = append(mergedEntries, e)
-				}
-				break
 			}
 		}
+		return items, nil
 	}
 
-	// 5. For each ARP entry, resolve hostname and vendor.
-	for _, entry := range mergedEntries {
-		// Skip if MAC is zero or broadcast
-		if entry.mac == "00:00:00:00:00:00" || entry.mac == "ff:ff:ff:ff:ff:ff" {
-			continue
-		}
-		// Skip if we already have this MAC (deduplicate)
-		if _, exists := discovered[entry.mac]; exists {
-			continue
-		}
-
-		// Resolve hostname via reverse DNS
-		hostname := ""
-		names, err := net.LookupAddr(entry.ip.String())
-		if err == nil && len(names) > 0 {
-			hostname = strings.TrimSuffix(names[0], ".") // remove trailing dot
-		}
-		if hostname == "" {
-			// Try mDNS query for .local names — fallback to empty in this session
-			hostname = queryMDNS(entry.ip)
-		}
-
-		// Lookup vendor from MAC OUI
-		vendor := lookupVendor(entry.mac)
-
-		device := Device{
-			MAC:      entry.mac,
-			IP:       entry.ip.String(),
-			Hostname: hostname,
-			Vendor:   vendor,
-		}
-		mu.Lock()
-		discovered[entry.mac] = device
-		mu.Unlock()
-	}
-
-	// 6. Skip the user's own device from results (but keep info accessible via Self)
-	var results []Device
-	for _, dev := range discovered {
-		isSelf := false
-		for _, local := range localAddrs {
-			if dev.MAC == local.mac || dev.IP == local.ip.String() {
-				isSelf = true
-				break
-			}
-		}
-		if !isSelf {
-			results = append(results, dev)
-		}
-	}
-
-	return results, nil
+	return nil, errors.New("tidak dapat membaca tabel ARP di Linux")
 }
 
-// Self returns the user's own device info (IP, MAC, hostname).
-func (d *Discovery) Self(ctx context.Context) (Device, error) {
-	interfaces, err := net.Interfaces()
+// readARPTableWindows membaca keluaran perintah `arp -a`.
+func readARPTableWindows() ([]arpItem, error) {
+	out, err := exec.Command("arp", "-a").Output()
 	if err != nil {
-		return Device{}, fmt.Errorf("list interfaces: %w", err)
+		return nil, err
 	}
-	for _, iface := range interfaces {
-		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
-				continue
-			}
-			mac := iface.HardwareAddr.String()
-			if len(mac) == 0 {
-				continue
-			}
-			hostname, _ := os.Hostname()
-			return Device{
-				MAC:      mac,
-				IP:       ip.String(),
-				Hostname: hostname,
-				Vendor:   "",
-			}, nil
-		}
-	}
-	return Device{}, errors.New("no suitable interface found for self")
+	return parseGenericARP(string(out))
 }
 
-// interfaceAddr holds local interface information.
-type interfaceAddr struct {
-	iface    net.Interface
-	ip       net.IP
-	mac      string
-	network  net.IP // network address (e.g., 192.168.1.0)
-}
-
-// pingHostIP sends a single ICMP echo request to the given IP with timeout.
-// Uses os/exec to call platform ping command. On Linux: ping -c 1 -W <timeout_sec>.
-func pingHostIP(ip net.IP, timeout time.Duration) error {
-	// On Linux, ping -c 1 -W <seconds> (fractional allowed)
-	// Convert timeout to seconds with 1 decimal place
-	timeoutStr := strconv.FormatFloat(timeout.Seconds(), 'f', 1, 64)
-	cmd := exec.Command("ping", "-c", "1", "-W", timeoutStr, ip.String())
-	output, err := cmd.Output()
+// readARPTableDarwin membaca keluaran perintah `arp -an`.
+func readARPTableDarwin() ([]arpItem, error) {
+	out, err := exec.Command("arp", "-an").Output()
 	if err != nil {
-		// ping may fail if host not reachable or ICMP blocked; either way continue
-		_ = output
-		return err
+		return nil, err
 	}
-	_ = output
-	return nil
+	return parseGenericARP(string(out))
 }
 
-// queryMDNS attempts to resolve hostname via mDNS for .local names.
-// For this session, returns empty string (full implementation uses hashicorp/mdns).
-func queryMDNS(ip net.IP) string {
-	// TODO: implement mDNS query using hashicorp/mdns in future session
+// parseGenericARP mengurai teks keluaran dari arp -a / arp -an.
+func parseGenericARP(output string) ([]arpItem, error) {
+	var items []arpItem
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		var foundIP, foundMAC string
+		for _, f := range fields {
+			cleanIP := strings.Trim(f, "()")
+			if net.ParseIP(cleanIP) != nil && cleanIP != "255.255.255.255" {
+				foundIP = cleanIP
+			}
+			cleanMAC := strings.ReplaceAll(f, "-", ":")
+			if isMACString(cleanMAC) {
+				foundMAC = strings.ToUpper(cleanMAC)
+			}
+		}
+		if foundIP != "" && foundMAC != "" && foundMAC != "00:00:00:00:00:00" {
+			items = append(items, arpItem{ip: foundIP, mac: foundMAC})
+		}
+	}
+	return items, nil
+}
+
+// isMACString memvalidasi apakah string merupakan alamat MAC format 6 oktet.
+func isMACString(s string) bool {
+	parts := strings.Split(s, ":")
+	if len(parts) != 6 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) != 2 {
+			return false
+		}
+	}
+	return true
+}
+
+// isIgnoredMAC memeriksa apakah MAC adalah broadcast atau zero.
+func isIgnoredMAC(mac string) bool {
+	macUpper := strings.ToUpper(mac)
+	return macUpper == "00:00:00:00:00:00" ||
+		macUpper == "FF:FF:FF:FF:FF:FF" ||
+		strings.HasPrefix(macUpper, "01:00:5E") ||
+		strings.HasPrefix(macUpper, "33:33:")
+}
+
+// isIPInSubnets memeriksa apakah IP berada dalam daftar subnet yang diizinkan.
+func isIPInSubnets(ip net.IP, subnets []subnetInterface) bool {
+	for _, s := range subnets {
+		if s.ipNet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveHostname mencoba mencari nama host via reverse DNS dengan batas waktu 1 detik.
+func resolveHostname(ctx context.Context, ipStr string) string {
+	lookupCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+
+	names, err := net.DefaultResolver.LookupAddr(lookupCtx, ipStr)
+	if err == nil && len(names) > 0 {
+		return strings.TrimSuffix(names[0], ".")
+	}
 	return ""
 }
 
-// lookupVendor returns vendor name from MAC OUI.
-// For this session, uses a small embedded map. In practice, load internal/oui.csv.
-func lookupVendor(mac string) string {
-	mac = strings.TrimSpace(mac)
+// LookupVendor memetakan prefix OUI alamat MAC ke nama pabrikan terkemuka.
+func LookupVendor(mac string) string {
+	mac = strings.ReplaceAll(strings.ToUpper(strings.TrimSpace(mac)), "-", ":")
 	if len(mac) < 8 {
 		return ""
 	}
-	oui := strings.ToUpper(mac[0:8])
+	oui := mac[:8]
+
 	switch oui {
-	case "00:1A:7D":
+	// Apple
+	case "00:1A:7D", "00:25:00", "00:26:BB", "3C:D9:2B", "9C:D9:1D", "AC:DE:48", "F0:18:98":
 		return "Apple"
-	case "00:25:90":
+	// Samsung
+	case "00:25:90", "14:49:E0", "34:23:BA", "50:85:69", "54:92:BE", "88:32:9B":
 		return "Samsung"
-	case "3C:5A:B4":
+	// Google
+	case "3C:5A:B4", "54:60:09", "94:EB:CD", "F4:F5:DB":
 		return "Google"
-	case "DC:A6:32":
-		return "Amazon"
-	case "00:E0:4C":
-		return "Realtek"
-	case "00:0C:29":
-		return "VMware"
-	case "00:50:56":
-		return "VMware"
-	case "00:05:69":
-		return "Intel"
-	case "00:1B:21":
-		return "Intel"
-	case "00:22:4D":
-		return "Red Hat"
-	case "00:23:AE":
-		return "Dell"
-	case "00:26:B9":
+	// TP-Link
+	case "00:26:B9", "50:D4:F7", "60:32:B1", "70:4F:57", "98:48:27", "C0:06:C3":
 		return "TP-Link"
-	case "A0:36:9F":
-		return "Cisco"
-	case "B8:27:EB":
-		return "Raspberry Pi"
-	case "F0:18:97":
-		return "OnePlus"
-	case "AC:DE:4C":
-		return "HP"
-	case "00:1F:33":
-		return "Intel Corporate"
-	case "9C:D9:1D":
-		return "Apple iPhone"
-	case "F8:1A:5E":
+	// Xiaomi
+	case "00:9E:C8", "28:6C:07", "7C:49:EB", "84:F3:EB", "F8:1A:5E":
 		return "Xiaomi"
-	case "B4:65:1E":
-		return "LG Electronics"
-	case "70:5B:CB":
-		return "Sony"
-	case "D0:73:D3":
-		return "Intel Corporate"
-	case "E8:9A:37":
+	// Intel
+	case "00:05:69", "00:1B:21", "00:1F:33", "00:25:2C", "D0:73:D3":
+		return "Intel"
+	// Raspberry Pi
+	case "B8:27:EB", "DC:A6:32", "E4:5F:01":
+		return "Raspberry Pi"
+	// Espressif (IoT ESP8266/ESP32)
+	case "24:6F:28", "30:AE:A4", "84:0D:8E", "A4:CF:12", "C4:4F:33":
+		return "Espressif (IoT)"
+	// Cisco
+	case "00:00:0C", "00:01:42", "A0:36:9F", "E4:AA:5D":
+		return "Cisco"
+	// MikroTik
+	case "48:8F:5A", "64:D1:54", "78:9A:18", "B8:69:F4", "C4:AD:34":
+		return "MikroTik"
+	// Dell
+	case "00:1E:52", "00:21:5B", "00:23:AE", "F0:4D:A2":
+		return "Dell"
+	// HP
+	case "00:80:5F", "2C:41:38", "3C:D9:2B:AA", "AC:DE:4C":
+		return "HP"
+	// Huawei
+	case "00:1E:10", "04:25:C5", "48:46:FB", "E8:CD:2D":
+		return "Huawei"
+	// Asus
+	case "00:1F:C6", "04:D9:F5", "1C:87:2C", "E8:9A:37":
 		return "ASUSTek"
-	case "00:0B:87":
-		return "Netgear"
-	case "00:1E:52":
-		return "Dell"
-	case "00:21:5B":
-		return "Dell"
-	case "00:25:2C":
-		return "Intel Corporate"
+	// Realtek
+	case "00:E0:4C", "52:54:00":
+		return "Realtek"
+	// VMware
+	case "00:0C:29", "00:50:56":
+		return "VMware"
 	}
+
 	return ""
-}
-
-// readARPTable reads the system ARP table. Tries /proc/net/arp on Linux first,
-// then falls back to `arp -a` command.
-func readARPTable() ([]arpEntry, error) {
-	// Try Linux /proc/net/arp first
-	if entries, err := readProcNetARP(); err == nil {
-		return entries, nil
-	}
-	// Fallback to arp -a command
-	return readARPCommand()
-}
-
-// readProcNetARP parses /proc/net/arp on Linux.
-// Format: IP HWtype Flags HWaddress Mask Iface
-// Example line: 192.168.1.1 0x1 0x2 00:11:22:33:44:55 * eth0
-func readProcNetARP() ([]arpEntry, error) {
-	data, err := readFile("/proc/net/arp")
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(string(data), "\n")
-	var entries []arpEntry
-	for i := 1; i < len(lines); i++ { // skip header
-		line := strings.TrimSpace(lines[i])
-		if line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
-			continue
-		}
-		ipStr := fields[0]
-		hwType := fields[1]
-		macStr := fields[3]
-		// Only consider Ethernet (HW type 1)
-		if hwType != "0x1" {
-			continue
-		}
-		ip := net.ParseIP(ipStr)
-		if ip == nil {
-			continue
-		}
-		mac := strings.TrimSpace(macStr)
-		if mac == "" || mac == "00:00:00:00:00:00" {
-			continue
-		}
-		// Basic MAC format validation
-		if len(mac) < 17 {
-			continue
-		}
-		entries = append(entries, arpEntry{ip: ip, mac: mac})
-	}
-	return entries, nil
-}
-
-// readFile reads file content via cat command.
-func readFile(path string) ([]byte, error) {
-	out, err := exec.Command("cat", path).Output()
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// readARPCommand falls back to executing `arp -a` and parsing output.
-func readARPCommand() ([]arpEntry, error) {
-	// Try arp -a first
-	cmd := exec.Command("arp", "-a")
-	output, err := cmd.Output()
-	if err == nil {
-		return parseARPOutput(string(output))
-	}
-	// If arp not available, try ip neigh
-	if strings.Contains(err.Error(), "exec: \"arp\"") || strings.Contains(err.Error(), "no such file or directory") {
-		cmd = exec.Command("ip", "neigh")
-		output, err = cmd.Output()
-		if err == nil {
-			return parseIPNeighOutput(string(output))
-		}
-	}
-	return nil, errors.New("could not read ARP table")
-}
-
-// parseARPOutput parses the output of `arp -a` or similar format.
-func parseARPOutput(output string) ([]arpEntry, error) {
-	var entries []arpEntry
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		// Look for IP and MAC in line
-		// Common format: ? (192.168.1.1) at aa:bb:cc:dd:ee:ff [ether] on eth0
-		ip := extractIPfromLine(line)
-		mac := extractMACfromLine(line)
-		if ip != nil && mac != "" && mac != "00:00:00:00:00:00" {
-			entries = append(entries, arpEntry{ip: ip, mac: mac})
-		}
-	}
-	return entries, nil
-}
-
-// extractIPfromLine extracts an IP address from a line of text.
-func extractIPfromLine(line string) net.IP {
-	parts := strings.Split(line, ".")
-	if len(parts) >= 4 {
-		for i := 0; i <= len(parts)-4; i++ {
-			candidate := parts[i] + "." + parts[i+1] + "." + parts[i+2] + "." + parts[i+3]
-			if ip := net.ParseIP(candidate); ip != nil && !ip.IsLoopback() {
-				return ip
-			}
-		}
-	}
-	return nil
-}
-
-// extractMACfromLine extracts a MAC address from a line of text.
-func extractMACfromLine(line string) string {
-	// Look for xx:xx:xx:xx:xx:xx pattern
-	// Find colon-separated hex groups
-	start := strings.Index(line, ":")
-	if start < 0 {
-		return ""
-	}
-	// Try to extract 6 colon-separated hex pairs
-	end := start + 17 // xx:xx:xx:xx:xx:xx is 17 chars
-	if end > len(line) {
-		end = len(line)
-	}
-	candidate := line[start:end]
-	parts := strings.Split(candidate, ":")
-	if len(parts) == 6 {
-		valid := true
-		for _, p := range parts {
-			if len(p) != 2 {
-				valid = false
-				break
-			}
-			for _, c := range p {
-				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-					valid = false
-					break
-				}
-			}
-			if !valid {
-				break
-			}
-		}
-		if valid {
-			return candidate
-		}
-	}
-	return ""
-}
-
-// parseIPNeighOutput parses output of `ip neigh` command.
-// Format: 192.168.1.1 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACH
-func parseIPNeighOutput(output string) ([]arpEntry, error) {
-	var entries []arpEntry
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) < 5 {
-			continue
-		}
-		ip := net.ParseIP(parts[0])
-		if ip == nil {
-			continue
-		}
-		var mac string
-		for i, p := range parts {
-			if p == "lladdr" && i+1 < len(parts) {
-				mac = parts[i+1]
-				break
-			}
-		}
-		if mac != "" && mac != "00:00:00:00:00:00" {
-			entries = append(entries, arpEntry{ip: ip, mac: mac})
-		}
-	}
-	return entries, nil
 }

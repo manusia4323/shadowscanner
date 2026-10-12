@@ -1,73 +1,71 @@
-// Package ports implements checking a small, fixed list of common ports on
-// devices to help guess device type. This is not an offensive port scanner.
-// It only performs TCP connect checks with timeouts and light banner reading.
-package ports
+// Package scanner menyediakan fungsi pemindaian defensif untuk jaringan lokal.
+package scanner
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
-	"strconv"
 	"sync"
 	"time"
 )
 
-// PortResult holds the result of checking a single port on a device.
+// PortResult menyimpan hasil pemeriksaan satu port pada perangkat target.
 type PortResult struct {
-	IP    string
-	Port  int
-	Open  bool
-	Banner string
+	IP     string // Alamat IP perangkat target
+	Port   int    // Nomor port yang diperiksa
+	Open   bool   // true jika koneksi TCP berhasil terhubung
+	Banner string // Cuplikan banner layanan (maks. 256 byte, hanya untuk port tertentu)
 }
 
-// CheckPorts checks a small, fixed list of common ports on the given IP.
-// It returns a slice of PortResult for each port in the list.
-// The context is used for cancellation.
-// The fixed port list is: 21, 22, 23, 53, 80, 139, 443, 445, 3389, 8080, 8443
+// FixedPorts adalah daftar port tetap dan terbatas yang diizinkan untuk diperiksa
+// guna mengenali jenis perangkat. Tidak boleh ditambahkan port di luar daftar ini.
+var FixedPorts = []int{21, 22, 23, 53, 80, 139, 443, 445, 3389, 8080, 8443}
+
+// CheckPorts memeriksa daftar port tetap pada alamat IP target secara defensif
+// menggunakan TCP connect standar dengan batas waktu tertentu.
+// Seluruh operasi mematuhi pembatalan melalui context.Context.
 func CheckPorts(ctx context.Context, ip string, timeout time.Duration) ([]PortResult, error) {
 	if ip == "" {
-		return nil, errors.New("IP address is required")
+		return nil, errors.New("alamat IP tidak boleh kosong")
 	}
 	if timeout <= 0 {
-		return nil, errors.New("timeout must be positive")
+		timeout = 300 * time.Millisecond
 	}
 
-	// Fixed list of ports to check (do not modify)
-	ports := []int{21, 22, 23, 53, 80, 139, 443, 445, 3389, 8080, 8443}
-
-	results := make([]PortResult, len(ports))
+	results := make([]PortResult, len(FixedPorts))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	// Check all ports concurrently with a limit of 11 goroutines (one per port)
-	sem := make(chan struct{}, len(ports)) // allow all to run concurrently (11 total)
+	// Batasi konkuren maksimal 11 goroutine (satu per port).
+	sem := make(chan struct{}, len(FixedPorts))
 
-	for i, port := range ports {
+	for i, port := range FixedPorts {
 		wg.Add(1)
 		sem <- struct{}{}
+
 		go func(idx int, p int) {
 			defer func() {
-				wg.Done()
 				<-sem
+				wg.Done()
 			}()
 
-			// Check if context is cancelled before starting
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
 
-			// Attempt TCP connect with timeout
-			address := net.JoinHostPort(ip, strconv.Itoa(p))
-			conn, err := net.DialTimeout("tcp", address, timeout)
+			targetAddr := net.JoinHostPort(ip, fmt.Sprintf("%d", p))
+			dialer := net.Dialer{Timeout: timeout}
+
+			conn, err := dialer.DialContext(ctx, "tcp", targetAddr)
 			if err != nil {
-				// Connection failed or timeout - port is closed or unreachable
 				mu.Lock()
 				results[idx] = PortResult{
-					IP:    ip,
-					Port:  p,
-					Open:  false,
+					IP:     ip,
+					Port:   p,
+					Open:   false,
 					Banner: "",
 				}
 				mu.Unlock()
@@ -75,35 +73,30 @@ func CheckPorts(ctx context.Context, ip string, timeout time.Duration) ([]PortRe
 			}
 			defer conn.Close()
 
-			// Connection succeeded - port is open
-			result := PortResult{
-				IP:    ip,
-				Port:  p,
-				Open:  true,
+			res := PortResult{
+				IP:     ip,
+				Port:   p,
+				Open:   true,
 				Banner: "",
 			}
 
-			// For ports 21, 22, 23, 80: attempt to read a banner (max 256 bytes)
-			// with a 200ms read deadline. This is read-only, no data sent.
+			// Untuk port 21, 22, 23, 80: coba baca banner hingga 256 byte
+			// dengan batas waktu 200 ms (hanya baca pasif, tanpa mengirim data).
 			if p == 21 || p == 22 || p == 23 || p == 80 {
-				// Set read deadline
 				_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 				buf := make([]byte, 256)
-				n, err := conn.Read(buf)
-				if err == nil && n > 0 {
-					// Successfully read banner data
-					result.Banner = string(buf[:n])
+				n, readErr := conn.Read(buf)
+				if readErr == nil && n > 0 {
+					res.Banner = string(buf[:n])
 				}
-				// If err != nil (timeout or error), we leave Banner empty
-				// This is fine - we tried but got no banner
 			}
 
 			mu.Lock()
-			results[idx] = result
+			results[idx] = res
 			mu.Unlock()
 		}(i, port)
 	}
-	wg.Wait()
 
+	wg.Wait()
 	return results, nil
 }

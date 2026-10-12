@@ -1,43 +1,42 @@
-// Package selfinfo mengumpulkan informasi tentang perangkat pengguna sendiri
-// dalam bahasa Indonesia yang mudah dipahami.
+// Package local mengumpulkan informasi tentang perangkat pengguna sendiri,
+// koneksi jaringan aktif, dan proses yang membuka soket.
 package local
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
 
-	"github.com/shirou/gopsutil/v4/host"
-	"shadowscanner/internal/config"
+	"github.com/shirou/gopsutil/v3/host"
 )
 
 // SelfInfo merekam informasi lengkap tentang perangkat pengguna
 // untuk ditampilkan dalam antarmuka dalam bahasa Indonesia.
 type SelfInfo struct {
-	Hostname     string   // Nama host perangkat (mis. "laptop-ani")
-	OS           string   // Sistem operasi lengkap (mis. "Ubuntu 22.04 LTS")
-	Arch         string   // Arsitektur processor (mis. "x86_64")
-	Interfaces   []NICInfo // Daftar antarmuka jaringan aktif
-	PrimaryIP    string   // IP utama untuk koneksi keluar
-	PrimaryMAC   string   // MAC yang berhubungan dengan IP utama
-	GatewayIP    string   // IP gateway/default route
-	GatewayMAC   string   // MAC gateway (dari ARP table)
-	DNSServers   []string // Alamat DNS yang digunakan
+	Hostname   string    // Nama host perangkat (mis. "laptop-ani")
+	OS         string    // Sistem operasi lengkap (mis. "Ubuntu 22.04 LTS")
+	Arch       string    // Arsitektur processor (mis. "amd64")
+	Interfaces []NICInfo // Daftar antarmuka jaringan aktif
+	PrimaryIP  string    // IP utama untuk koneksi keluar
+	PrimaryMAC string    // MAC yang berhubungan dengan IP utama
+	GatewayIP  string    // IP gateway/default route
+	GatewayMAC string    // MAC gateway (dari ARP table)
+	DNSServers []string  // Alamat DNS yang digunakan
 }
 
 // NICInfo merekam informasi tentang satu antarmuka jaringan.
 type NICInfo struct {
-	Name    string // Nama antarmuka (mis. "eth0", "wlan0")
-	MAC     string // Alamat MAC dalam format XX:XX:XX:XX:XX:XX
-	IPs     []string // Daftar alamat IP yang diassigned ke antarmuka ini
-	IsWiFi  bool   // true jika antarmuka ini adalah koneksi nirkabel
-	IsUp    bool   // true jika antarmuka aktif dan siap digunakan
+	Name   string   // Nama antarmuka (mis. "eth0", "wlan0")
+	MAC    string   // Alamat MAC dalam format XX:XX:XX:XX:XX:XX
+	IPs    []string // Daftar alamat IP yang diassign ke antarmuka ini
+	IsWiFi bool     // true jika antarmuka ini adalah koneksi nirkabel
+	IsUp   bool     // true jika antarmuka aktif dan siap digunakan
 }
 
 // Get mengembalikan SelfInfo lengkap tentang perangkat pengguna.
@@ -47,44 +46,49 @@ func Get(ctx context.Context) (SelfInfo, error) {
 	var err error
 
 	// Hostname
-	if info.Hostname, err = os.Hostname(); err != nil {
-		return SelfInfo{}, fmt.Errorf("get hostname: %w", err)
+	info.Hostname, err = os.Hostname()
+	if err != nil {
+		return SelfInfo{}, fmt.Errorf("gagal mendapatkan hostname: %w", err)
 	}
 
-	// OS dan Arch dari runtime + detail dari gopsutil
+	// Arsitektur
 	info.Arch = runtime.GOARCH
+
+	// OS info dari gopsutil
 	if hostInfo, err := host.InfoWithContext(ctx); err == nil {
-		info.OS = hostInfo.OS + " " + hostInfo.Platform + " " + hostInfo.PlatformVersion
-	} else {
-		// Fallback ke runtime saja jika gopsutil gagal
-		info.OS = runtime.GOOS
-		if hostInfo, err := host.InfoWithContext(ctx); err == nil {
-			info.OS = hostInfo.OS
+		platform := hostInfo.Platform
+		if platform == "" {
+			platform = hostInfo.OS
 		}
+		version := hostInfo.PlatformVersion
+		if version != "" {
+			info.OS = fmt.Sprintf("%s %s", platform, version)
+		} else {
+			info.OS = platform
+		}
+	} else {
+		info.OS = runtime.GOOS
 	}
 
-	// Dapatkan daftar antarmuka
-	if info.Interfaces, err = getNetworkInterfaces(); err != nil {
-		return SelfInfo{}, fmt.Errorf("get network interfaces: %w", err)
+	// Antarmuka jaringan
+	info.Interfaces, err = getNetworkInterfaces()
+	if err != nil {
+		return SelfInfo{}, fmt.Errorf("gagal membaca antarmuka jaringan: %w", err)
 	}
 
-	// Dapatkan IP/MAC utama, gateway, dan DNS
-	if info.PrimaryIP, info.PrimaryMAC, err = getPrimaryInterface(); err != nil {
-		return SelfInfo{}, fmt.Errorf("get primary interface: %w", err)
-	}
+	// IP dan MAC utama
+	info.PrimaryIP, info.PrimaryMAC, _ = getPrimaryInterface()
 
-	if info.GatewayIP, info.GatewayMAC, err = getGatewayInfo(); err != nil {
-		return SelfInfo{}, fmt.Errorf("get gateway info: %w", err)
-	}
+	// Gateway IP dan MAC
+	info.GatewayIP, info.GatewayMAC, _ = getGatewayInfo()
 
-	if info.DNSServers, err = getDNSServers(); err != nil {
-		return SelfInfo{}, fmt.Errorf("get DNS servers: %w", err)
-	}
+	// DNS servers
+	info.DNSServers, _ = getDNSServers()
 
 	return info, nil
 }
 
-// getNetworkInterfaces membaca semua antarmuka jaringan aktif.
+// getNetworkInterfaces membaca semua antarmuka jaringan non-loopback yang aktif.
 func getNetworkInterfaces() ([]NICInfo, error) {
 	interfaces, err := net.Interfaces()
 	if err != nil {
@@ -93,19 +97,18 @@ func getNetworkInterfaces() ([]NICInfo, error) {
 
 	var result []NICInfo
 	for _, iface := range interfaces {
-		// Skip loopback dan interface yang tidak aktif
-		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+		if iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
 
+		isUp := iface.Flags&net.FlagUp != 0
 		nic := NICInfo{
-			Name: iface.Name,
-			MAC:  iface.HardwareAddr.String(),
+			Name:   iface.Name,
+			MAC:    iface.HardwareAddr.String(),
 			IsWiFi: isWiFiInterface(iface.Name),
-			IsUp:   iface.Flags&net.FlagUp != 0,
+			IsUp:   isUp,
 		}
 
-		// Dapatkan alamat IP untuk interface ini
 		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
@@ -121,36 +124,30 @@ func getNetworkInterfaces() ([]NICInfo, error) {
 			if ip == nil || ip.IsLoopback() {
 				continue
 			}
-			if ip.To4() == nil {
-				continue // IPv4 only
+			if ip.To4() != nil {
+				nic.IPs = append(nic.IPs, ip.String())
 			}
-			nic.IPs = append(nic.IPs, ip.String())
 		}
 
-		if len(nic.IPs) > 0 {
-			result = append(result, nic)
-		}
+		result = append(result, nic)
 	}
 
 	return result, nil
 }
 
-// isWiFiInterface mencoba mendeteksi apakah antarmuka adalah WiFi
-// berdasarkan nama umum (heuristik sederhana).
+// isWiFiInterface mendeteksi apakah antarmuka merupakan koneksi WiFi berdasarkan pola nama.
 func isWiFiInterface(name string) bool {
-	name = strings.ToLower(name)
-	return strings.Contains(name, "wlan") ||
-		strings.Contains(name, "wifi") ||
-		strings.Contains(name, "wi-fi") ||
-		strings.Contains(name, "ath") ||
-		strings.Contains(name, "ra") ||
-		strings.HasPrefix(name, "wl")
+	lower := strings.ToLower(name)
+	return strings.Contains(lower, "wlan") ||
+		strings.Contains(lower, "wifi") ||
+		strings.Contains(lower, "wi-fi") ||
+		strings.Contains(lower, "ath") ||
+		strings.Contains(lower, "ra") ||
+		strings.HasPrefix(lower, "wl")
 }
 
-// getPrimaryInterface mengembalikan IP dan MAC dari antarmuka
-// yang memiliki default route (untuk koneksi keluar).
+// getPrimaryInterface mencari IP dan MAC antarmuka rute utama (default route).
 func getPrimaryInterface() (string, string, error) {
-	// Baca routing table untuk menemukan default route
 	switch runtime.GOOS {
 	case "linux":
 		return getPrimaryInterfaceLinux()
@@ -159,137 +156,122 @@ func getPrimaryInterface() (string, string, error) {
 	case "darwin":
 		return getPrimaryInterfaceDarwin()
 	default:
-		return "", "", fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+		return getFallbackInterface()
 	}
 }
 
-// getPrimaryInterfaceLinux membaca /proc/net/route untuk Linux.
+// getPrimaryInterfaceLinux membaca /proc/net/route untuk rute 00000000.
 func getPrimaryInterfaceLinux() (string, string, error) {
 	data, err := os.ReadFile("/proc/net/route")
 	if err != nil {
-		return "", "", err
+		return getFallbackInterface()
 	}
 
 	lines := strings.Split(string(data), "\n")
-	for _, line := range lines[1:] { // Skip header
+	for _, line := range lines[1:] {
 		fields := strings.Fields(line)
-		if len(fields) < 8 {
-			continue
-		}
-		// Destination 00000000 = default route
-		if fields[0] != "00000000" {
-			continue
-		}
-		iface := fields[0] // Actually interface name is in first column
-		iface = fields[0] // No, let me check format again
-		// Format: Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
-		if len(fields) < 8 {
-			continue
-		}
-		if fields[0] == "" || fields[1] != "00000000" {
-			continue
-		}
-		iface = fields[0]
-		// Dapatkan MAC untuk interface ini
-		mac, err := getMACForInterface(iface)
-		if err != nil {
-			continue
-		}
-		// Dapatkan IP untuk interface ini
-		ip, err := getIPForInterface(iface)
-		if err != nil {
-			continue
-		}
-		return ip, mac, nil
-	}
-	return "", "", errors.New("no default route found")
-}
-
-// getPrimaryInterfaceWindows menggunakan `route print`.
-func getPrimaryInterfaceWindows() (string, string, error) {
-	out, err := exec.Command("route", "print", "0.0.0.0").Output()
-	if err != nil {
-		return "", "", err
-	}
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "0.0.0.0") && strings.Contains(line, "0.0.0.0") {
-			// Format tidak konsisten, untuk sekarang kembalikan placeholder
-			// Implementasi lengkap akan memproses output ini dengan lebih teliti
-			ifaces, _ := net.Interfaces()
-			if len(ifaces) > 0 {
-				for _, iface := range ifaces {
-					if iface.Flags&net.FlagLoopback == 0 && iface.Flags&net.FlagUp != 0 {
-						addrs, _ := iface.Addrs()
-						for _, addr := range addrs {
-							var ip net.IP
-							switch v := addr.(type) {
-							case *net.IPNet:
-								ip = v.IP
-							case *net.IPAddr:
-								ip = v.IP
-							}
-							if ip != nil && !ip.IsLoopback() && ip.To4() != nil {
-								return ip.String(), iface.HardwareAddr.String(), nil
-							}
-						}
-					}
-				}
-			}
-			break
-		}
-	}
-	return "", "", errors.New("could not parse route output")
-}
-
-// getPrimaryInterfaceDarwin menggunakan `netstat -rn`.
-func getPrimaryInterfaceDarwin() (string, string, error) {
-	out, err := exec.Command("netstat", "-rn").Output()
-	if err != nil {
-		return "", "", err
-	}
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "default") {
-			fields := strings.Fields(line)
-			if len(fields) >= 6 && fields[0] == "default" {
-				iface := fields[5]
-				mac, err := getMACForInterface(iface)
-				if err != nil {
-					continue
-				}
-				ip, err := getIPForInterface(iface)
-				if err != nil {
-					continue
-				}
+		if len(fields) >= 2 && fields[1] == "00000000" {
+			ifaceName := fields[0]
+			ip, mac := getIfaceIPAndMAC(ifaceName)
+			if ip != "" {
 				return ip, mac, nil
 			}
 		}
 	}
-	return "", "", errors.New("no default route found")
+
+	return getFallbackInterface()
 }
 
-// getMACForInterface mengembalikan MAC address untuk nama interface yang diberikan.
-func getMACForInterface(name string) (string, error) {
-	iface, err := net.InterfaceByName(name)
+// getPrimaryInterfaceWindows menggunakan `route print 0.0.0.0`.
+func getPrimaryInterfaceWindows() (string, string, error) {
+	cmd := exec.Command("route", "print", "0.0.0.0")
+	out, err := cmd.Output()
 	if err != nil {
-		return "", err
+		return getFallbackInterface()
 	}
-	if iface.HardwareAddr == nil {
-		return "", errors.New("no hardware address")
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		// Format IPv4 Route Table: Network Destination Netmask Gateway Interface Metric
+		if len(fields) >= 4 && fields[0] == "0.0.0.0" && fields[1] == "0.0.0.0" {
+			ip := fields[3]
+			if net.ParseIP(ip) != nil {
+				mac := findMACByIP(ip)
+				return ip, mac, nil
+			}
+		}
 	}
-	return iface.HardwareAddr.String(), nil
+
+	return getFallbackInterface()
 }
 
-// getIPForInterface mengembalikan alamat IPv4 pertama untuk interface yang diberikan.
-func getIPForInterface(name string) (string, error) {
+// getPrimaryInterfaceDarwin menggunakan `netstat -rn`.
+func getPrimaryInterfaceDarwin() (string, string, error) {
+	cmd := exec.Command("netstat", "-rn")
+	out, err := cmd.Output()
+	if err != nil {
+		return getFallbackInterface()
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 6 && fields[0] == "default" {
+			ifaceName := fields[5]
+			ip, mac := getIfaceIPAndMAC(ifaceName)
+			if ip != "" {
+				return ip, mac, nil
+			}
+		}
+	}
+
+	return getFallbackInterface()
+}
+
+// getFallbackInterface mengembalikan antarmuka aktif non-loopback pertama.
+func getFallbackInterface() (string, string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", "", err
+	}
+
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && !ip.IsLoopback() && ip.To4() != nil {
+				return ip.String(), iface.HardwareAddr.String(), nil
+			}
+		}
+	}
+
+	return "", "", errors.New("tidak ada antarmuka jaringan yang sesuai")
+}
+
+// getIfaceIPAndMAC mengambil IP IPv4 dan MAC dari antarmuka bernama tertentu.
+func getIfaceIPAndMAC(name string) (string, string) {
 	iface, err := net.InterfaceByName(name)
 	if err != nil {
-		return "", err
+		return "", ""
 	}
+	mac := iface.HardwareAddr.String()
+
 	addrs, err := iface.Addrs()
 	if err != nil {
-		return "", err
+		return "", mac
 	}
 	for _, addr := range addrs {
 		var ip net.IP
@@ -299,18 +281,34 @@ func getIPForInterface(name string) (string, error) {
 		case *net.IPAddr:
 			ip = v.IP
 		}
-		if ip == nil || ip.IsLoopback() {
-			continue
+		if ip != nil && !ip.IsLoopback() && ip.To4() != nil {
+			return ip.String(), mac
 		}
-		if ip.To4() == nil {
-			continue // IPv4 only
-		}
-		return ip.String(), nil
 	}
-	return "", errors.New("no IPv4 address found")
+	return "", mac
 }
 
-// getGatewayInfo membaca gateway IP dan MAC dari routing dan ARP table.
+// findMACByIP mencari MAC dari interface yang memiliki IP tersebut.
+func findMACByIP(targetIP string) string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if strings.Contains(addr.String(), targetIP) {
+				return iface.HardwareAddr.String()
+			}
+		}
+	}
+	return ""
+}
+
+// getGatewayInfo membaca gateway IP dan MAC dari routing table dan ARP.
 func getGatewayInfo() (string, string, error) {
 	switch runtime.GOOS {
 	case "linux":
@@ -320,172 +318,132 @@ func getGatewayInfo() (string, string, error) {
 	case "darwin":
 		return getGatewayInfoDarwin()
 	default:
-		return "", "", fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+		return "", "", errors.New("sistem operasi tidak didukung untuk pencarian gateway")
 	}
 }
 
-// getGatewayInfoLinux membaca gateway dari /proc/net/route dan MAC dari ARP.
+// getGatewayInfoLinux membaca rute 00000000 dari /proc/net/route lalu cari MAC di /proc/net/arp.
 func getGatewayInfoLinux() (string, string, error) {
-	// Dapatkan gateway IP dari routing table
 	data, err := os.ReadFile("/proc/net/route")
 	if err != nil {
 		return "", "", err
 	}
-	var gatewayIP net.IP
+
+	var gwIP string
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines[1:] {
 		fields := strings.Fields(line)
-		if len(fields) < 8 {
-			continue
-		}
-		if fields[0] == "" || fields[1] != "00000000" {
-			continue
-		}
-		// Gateway adalah fields[2] dalam format hex
-		gwHex := fields[2]
-		if len(gwHex) == 8 {
-			gatewayIP = net.ParseIP(fmt.Sprintf("%d.%d.%d.%d",
-				hexToInt(gwHex[0:2]),
-				hexToInt(gwHex[2:4]),
-				hexToInt(gwHex[4:6]),
-				hexToInt(gwHex[6:8])))
-			if gatewayIP != nil {
+		if len(fields) >= 3 && fields[1] == "00000000" {
+			gwHex := fields[2]
+			if len(gwHex) == 8 {
+				b0, _ := strconv.ParseInt(gwHex[6:8], 16, 64)
+				b1, _ := strconv.ParseInt(gwHex[4:6], 16, 64)
+				b2, _ := strconv.ParseInt(gwHex[2:4], 16, 64)
+				b3, _ := strconv.ParseInt(gwHex[0:2], 16, 64)
+				gwIP = fmt.Sprintf("%d.%d.%d.%d", b0, b1, b2, b3)
 				break
 			}
 		}
 	}
-	if gatewayIP == nil {
-		return "", "", errors.New("could not find gateway IP")
+
+	if gwIP == "" {
+		return "", "", errors.New("gateway IP tidak ditemukan")
 	}
 
-	// Dapatkan MAC gateway dari ARP table
-	gatewayMAC, err := getMACFromARP(gatewayIP.String())
-	if err != nil {
-		return gatewayIP.String(), "", err // Return IP tanpa MAC jika ARP gagal
-	}
-	return gatewayIP.String(), gatewayMAC, nil
+	gwMAC := findMACInARPTable(gwIP)
+	return gwIP, gwMAC, nil
 }
 
-// getGatewayInfoWindows menggunakan `route print` dan `arp -a`.
+// getGatewayInfoWindows membaca route print.
 func getGatewayInfoWindows() (string, string, error) {
-	// Untuk session ini, kembalikan placeholder karena parsing output Windows kompleks
-	return "", "", errors.New("not implemented for Windows in this session")
+	out, err := exec.Command("route", "print", "0.0.0.0").Output()
+	if err != nil {
+		return "", "", err
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 4 && fields[0] == "0.0.0.0" && fields[1] == "0.0.0.0" {
+			gwIP := fields[2]
+			if net.ParseIP(gwIP) != nil {
+				gwMAC := findMACInARPTable(gwIP)
+				return gwIP, gwMAC, nil
+			}
+		}
+	}
+
+	return "", "", errors.New("gateway IP tidak ditemukan di Windows")
 }
 
-// getGatewayInfoDarwin menggunakan `netstat -rn` dan `arp -an`.
+// getGatewayInfoDarwin membaca netstat -rn.
 func getGatewayInfoDarwin() (string, string, error) {
-	// Dapatkan gateway IP
 	out, err := exec.Command("netstat", "-rn").Output()
 	if err != nil {
 		return "", "", err
 	}
+
 	lines := strings.Split(string(out), "\n")
-	var gatewayIP net.IP
 	for _, line := range lines {
-		if strings.Contains(line, "default") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				gatewayIP = net.ParseIP(fields[1])
-				if gatewayIP != nil {
-					break
-				}
-			}
-		}
-	}
-	if gatewayIP == nil {
-		return "", "", errors.New("could not find gateway IP")
-	}
-
-	// Dapatkan MAC dari ARP
-	gatewayMAC, err := getMACFromARP(gatewayIP.String())
-	if err != nil {
-		return gatewayIP.String(), "", err
-	}
-	return gatewayIP.String(), gatewayMAC, nil
-}
-
-// getMACFromARP mencari MAC address untuk IP yang diberikan dari ARP table.
-func getMACFromARP(ip string) (string, error) {
-	switch runtime.GOOS {
-	case "linux":
-		return getMACFromARPLinux(ip)
-	case "windows":
-		return getMACFromARPWindows(ip)
-	case "darwin":
-		return getMACFromARPDarwin(ip)
-	default:
-		return "", fmt.Errorf("unsupported OS: %s", runtime.GOOS)
-	}
-}
-
-// getMACFromARPLinux membaca /proc/net/arp.
-func getMACFromARPLinux(ip string) (string, error) {
-	data, err := os.ReadFile("/proc/net/arp")
-	if err != nil {
-		return "", err
-	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines[1:] { // Skip header
 		fields := strings.Fields(line)
-		if len(fields) < 4 {
-			continue
-		}
-		if fields[0] == ip {
-			return strings.TrimSpace(fields[3]), nil
-		}
-	}
-	return "", fmt.Errorf("MAC not found for IP %s in ARP table", ip)
-}
-
-// getMACFromARPWindows menggunakan `arp -a`.
-func getMACFromARPWindows(ip string) (string, error) {
-	out, err := exec.Command("arp", "-a", ip).Output()
-	if err != nil {
-		return "", err
-	}
-	output := string(out)
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, ip) {
-			// Format: 192.168.1.1          00-1a-2b-3c-4d-5e     dynamic
-			fields := strings.Fields(line)
-			if len(fields) >= 2 && fields[0] == ip {
-				mac := strings.ReplaceAll(fields[1], "-", ":")
-				return mac, nil
+		if len(fields) >= 3 && fields[0] == "default" {
+			gwIP := fields[1]
+			if net.ParseIP(gwIP) != nil {
+				gwMAC := findMACInARPTable(gwIP)
+				return gwIP, gwMAC, nil
 			}
 		}
 	}
-	return "", fmt.Errorf("MAC not found for IP %s in ARP output", ip)
+
+	return "", "", errors.New("gateway IP tidak ditemukan di macOS")
 }
 
-// getMACFromARPDarwin menggunakan `arp -an`.
-func getMACFromARPDarwin(ip string) (string, error) {
-	out, err := exec.Command("arp", "-an", ip).Output()
-	if err != nil {
-		return "", err
-	}
-	output := string(out)
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, ip) {
-			// Format: ? (192.168.1.1) at aa:bb:cc:dd:ee:ff [ether] on en0 ifscope [ethernet]
-			parts := strings.Split(line, "at")
-			if len(parts) >= 2 {
-				macPart := strings.TrimSpace(parts[1])
-				macFields := strings.Fields(macPart)
-				if len(macFields) >= 1 {
-					mac := macFields[0]
-					if mac != "(incomplete)" {
-						return mac, nil
+// findMACInARPTable membaca tabel ARP sistem untuk mencari MAC dari IP gateway.
+func findMACInARPTable(targetIP string) string {
+	if runtime.GOOS == "linux" {
+		if data, err := os.ReadFile("/proc/net/arp"); err == nil {
+			lines := strings.Split(string(data), "\n")
+			for _, line := range lines[1:] {
+				fields := strings.Fields(line)
+				if len(fields) >= 4 && fields[0] == targetIP {
+					mac := fields[3]
+					if mac != "00:00:00:00:00:00" {
+						return mac
 					}
 				}
 			}
 		}
 	}
-	return "", fmt.Errorf("MAC not found for IP %s in ARP output", ip)
+
+	// Fallback ke arp -a atau arp -an
+	arg := "-a"
+	if runtime.GOOS == "darwin" {
+		arg = "-an"
+	}
+	out, err := exec.Command("arp", arg).Output()
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, targetIP) {
+			fields := strings.Fields(line)
+			for _, f := range fields {
+				clean := strings.Trim(f, "()")
+				clean = strings.ReplaceAll(clean, "-", ":")
+				parts := strings.Split(clean, ":")
+				if len(parts) == 6 {
+					return clean
+				}
+			}
+		}
+	}
+
+	return ""
 }
 
-// getDNSServers membaca konfigurasi DNS dari sistem.
+// getDNSServers membaca daftar server DNS yang dikonfigurasi pada sistem.
 func getDNSServers() ([]string, error) {
 	switch runtime.GOOS {
 	case "linux":
@@ -495,7 +453,7 @@ func getDNSServers() ([]string, error) {
 	case "darwin":
 		return getDNSServersDarwin()
 	default:
-		return nil, fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+		return nil, errors.New("sistem operasi tidak didukung untuk pencarian DNS")
 	}
 }
 
@@ -505,15 +463,16 @@ func getDNSServersLinux() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	lines := strings.Split(string(data), "\n")
+
 	var servers []string
+	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "nameserver") {
 			fields := strings.Fields(line)
 			if len(fields) >= 2 {
 				ip := net.ParseIP(fields[1])
-				if ip != nil && !ip.IsLoopback() && ip.To4() != nil {
+				if ip != nil && ip.To4() != nil {
 					servers = append(servers, ip.String())
 				}
 			}
@@ -522,26 +481,64 @@ func getDNSServersLinux() ([]string, error) {
 	return servers, nil
 }
 
-// getDNSServersWindows menggunakan `ipconfig /all`.
+// getDNSServersWindows membaca ipconfig /all.
 func getDNSServersWindows() ([]string, error) {
-	// Placeholder untuk session ini
-	return []string{}, errors.New("not implemented for Windows in this session")
-}
-
-// getDNSServersDarwin menggunakan `scutil --dns`.
-func getDNSServersDarwin() ([]string, error) {
-	// Placeholder untuk session ini
-	return []string{}, errors.New("not implemented for Darwin in this session")
-}
-
-// hexToInt mengonversi string hex 2 karakter menjadi integer.
-func hexToInt(s string) int {
-	if len(s) != 2 {
-		return 0
-	}
-	val, err := strconv.ParseInt(s, 16, 64)
+	out, err := exec.Command("ipconfig", "/all").Output()
 	if err != nil {
-		return 0
+		return nil, err
 	}
-	return int(val)
+
+	var servers []string
+	lines := strings.Split(string(out), "\n")
+	capture := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(line, "DNS Servers") {
+			capture = true
+			parts := strings.Split(line, ":")
+			if len(parts) >= 2 {
+				ipStr := strings.TrimSpace(parts[1])
+				if ip := net.ParseIP(ipStr); ip != nil && ip.To4() != nil {
+					servers = append(servers, ipStr)
+				}
+			}
+			continue
+		}
+		if capture {
+			if strings.Contains(line, ":") {
+				capture = false
+				continue
+			}
+			if ip := net.ParseIP(trimmed); ip != nil && ip.To4() != nil {
+				servers = append(servers, trimmed)
+			}
+		}
+	}
+	return servers, nil
+}
+
+// getDNSServersDarwin membaca scutil --dns.
+func getDNSServersDarwin() ([]string, error) {
+	out, err := exec.Command("scutil", "--dns").Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var servers []string
+	seen := make(map[string]bool)
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "nameserver[") {
+			parts := strings.Split(line, ":")
+			if len(parts) >= 2 {
+				ipStr := strings.TrimSpace(parts[1])
+				if ip := net.ParseIP(ipStr); ip != nil && ip.To4() != nil && !seen[ipStr] {
+					seen[ipStr] = true
+					servers = append(servers, ipStr)
+				}
+			}
+		}
+	}
+	return servers, nil
 }

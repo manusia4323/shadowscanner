@@ -12,8 +12,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
-	"modernc.org/sqlite"
-	"modernc.org/sqlite/maturity"
+	"time"
+	_ "modernc.org/sqlite"
 )
 
 // DB adalah wrapper tipis untuk *sql.DB. Exported agar bisa digunakan
@@ -32,8 +32,8 @@ type DB struct {
 //   - Migrasi otomatis tabel (jika belum ada).
 func Open(path string) (*DB, error) {
 	// modernc.org/sqlite mendukung driver tanpa CGO.
-	// Pin driver modernc.org/sqlite agar konsisten di seluruh call Open.
-	dbDriver := "modernc.org/sqlite"
+	// Driver yang didaftarkan oleh modernc.org/sqlite adalah "sqlite".
+	dbDriver := "sqlite"
 
 	// Buka koneksi melalui driver database/sql umum.
 	// Parameter "?mode=memory" = only for in-memory; kita gunakan file.
@@ -61,10 +61,16 @@ func Open(path string) (*DB, error) {
 	_, err = db.ExecContext(context.Background(), "PRAGMA foreign_keys=ON")
 	if err != nil {
 		db.Close()
-		return nil, fmtaktifkan foreign keys: %w", err)
+		return nil, fmt.Errorf("aktifkan foreign keys: %w", err)
 	}
 
-	return &DB{db}, nil
+	storageDB := &DB{db}
+	if err := storageDB.Migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrasi skema database gagal: %w", err)
+	}
+
+	return storageDB, nil
 }
 
 // Migrate membuat semua tabel dan indeks jika belum ada. Tiap pemanggilan
@@ -165,8 +171,8 @@ func (db *DB) Migrate() error {
 	}
 
 	// --- Index ---
-	// idx_devices_mac: mempercepat pencarian by MAC.
-	_, err = tx.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_mac ON devices(mac)`)
+	// idx_devices_mac: menjamin keunikan MAC dan mempercepat pencarian.
+	_, err = tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_mac ON devices(mac)`)
 	if err != nil {
 		tx.Rollback()
 		return fmt.Errorf("buat idx_devices_mac: %w", err)
@@ -253,7 +259,7 @@ func (db *DB) ListDevices() ([]Device, error) {
 		devices = append(devices, d)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf "device rows error: %w", err
+		return nil, fmt.Errorf("device rows error: %w", err)
 	}
 	return devices, nil
 }
@@ -299,15 +305,15 @@ func (db *DB) ListAlerts(severity string) ([]Alert, error) {
 	defer rows.Close()
 
 	var alerts []Alert
-	for rows.Next() {
-		var a Alert
-		var acknowledged int
-		if err := rows.Scan(&a.ID, &a.Timestamp, &a.Severity, &a.Category, &a.Title, &a.Explanation, &a.Action, &a.Technical, &a.DeviceMAC, &acknowledged); err != nil {
-			return nil, fmt.Errorf("scan alert row: %w", err)
+		for rows.Next() {
+			var a Alert
+			var ack int
+			if err := rows.Scan(&a.ID, &a.Timestamp, &a.Severity, &a.Category, &a.Title, &a.Explanation, &a.Action, &a.Technical, &a.DeviceMAC, &ack); err != nil {
+				return nil, fmt.Errorf("scan alert row: %w", err)
+			}
+			a.Acknowledged = (ack == 1)
+			alerts = append(alerts, a)
 		}
-		a.Acknowledged = acknowledged == 1
-		alerts = append(alerts, a)
-	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("alert rows error: %w", err)
 	}
@@ -322,13 +328,10 @@ func (db *DB) AcknowledgeAlert(id int64) error {
 	return err
 }
 
-// InsertConnection memasukkan satu koneksi baru ke dalam tabel jika belum ada
-// (ditentukan oleh kombinasi localip+localport+remoteip+remoteport+timestamp).
+// InsertConnection memasukkan satu koneksi baru ke dalam tabel connections.
 func (db *DB) InsertConnection(c *Connection) error {
-	// Cek duplikat: gabungan port & IP.
 	q := `INSERT INTO connections(timestamp, direction, localip, localport, remoteip, remoteport, protocol, processname, processpid, state)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(localip, localport, remoteip, remoteport) DO NOTHING`
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	_, err := db.Exec(q, c.Timestamp, c.Direction, c.LocalIP, c.LocalPort, c.RemoteIP, c.RemotePort, c.Protocol, c.ProcessName, c.ProcessPID, c.State)
 	return err
 }
@@ -355,9 +358,7 @@ func (db *DB) ListConnections(limit int) ([]Connection, error) {
 	var connections []Connection
 	for rows.Next() {
 		var c Connection
-		var processPID int
-		var acknowledged int // tidak ada di sini, tapi scan handle
-		if err := rows.Scan(&c.ID, &c.Timestamp, &c.Direction, &c.LocalIP, &c.LocalPort, &c.RemoteIP, &c.RemotePort, &c.Protocol, &c.ProcessName, &processPID, &c.State); err != nil {
+		if err := rows.Scan(&c.ID, &c.Timestamp, &c.Direction, &c.LocalIP, &c.LocalPort, &c.RemoteIP, &c.RemotePort, &c.Protocol, &c.ProcessName, &c.ProcessPID, &c.State); err != nil {
 			return nil, fmt.Errorf("scan connection row: %w", err)
 		}
 		connections = append(connections, c)
@@ -418,7 +419,7 @@ func (db *DB) GetSetting(key string) (string, error) {
 		if err == sql.ErrNoRows {
 			return "", nil // key tidak ada, kembalikan string kosong (tidak error)
 		}
-		return "", fmt.Errorf "get setting: %w", err
+		return "", fmt.Errorf("get setting: %w", err)
 	}
 	return val, nil
 }
@@ -452,21 +453,21 @@ func (db *DB) PurgeOldData(retentionHours int) (int64, error) {
 	// Hapus dari alerts.
 	deletedAlerts, err := db.execPurge("alerts", "timestamp", cutoff)
 	if err != nil {
-		return 0, fmt.Errorf "purge alerts: %w", err
+		return 0, fmt.Errorf("purge alerts: %w", err)
 	}
 	totalDeleted += deletedAlerts
 
 	// Hapus dari connections.
 	deletedConnections, err := db.execPurge("connections", "timestamp", cutoff)
 	if err != nil {
-		return 0, fmt.Errorf "purge connections: %w", err
+		return 0, fmt.Errorf("purge connections: %w", err)
 	}
 	totalDeleted += deletedConnections
 
 	// Hapus dari scans.
 	deletedScans, err := db.execPurge("scans", "started_at", cutoff)
 	if err != nil {
-		return 0, fmt.Errorf "purge scans: %w", err
+		return 0, fmt.Errorf("purge scans: %w", err)
 	}
 	totalDeleted += deletedScans
 

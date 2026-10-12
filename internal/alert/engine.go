@@ -1,195 +1,191 @@
-// Package engine mengubah sinyal mentah dari scanner dan watcher menjadi
-// peringatan berbasis bahasa Indonesia dengan tingkat keparahan yang jelas.
+// Package alert menyediakan mesin deteksi dan pembuatan peringatan keamanan
+// dalam bahasa Indonesia yang mudah dipahami oleh pengguna non-teknis.
 package alert
 
 import (
-	"context"
+	"fmt"
+	"log/slog"
+	"sync"
 	"time"
 
 	"shadowscanner/internal/storage"
 )
 
-// Severity menampilkan tingkat keparahan peringatan.
+// Severity mendefinisikan tingkat keparahan suatu peringatan.
 type Severity string
 
 const (
-	// Aman: tidak ada tindakan yang diperlukan.
+	// SeveritySafe menandakan kondisi jaringan aman dan normal.
 	SeveritySafe Severity = "aman"
-	// Perhatian: ada sesuatu yang perlu diperhatikan tetapi tidak berbahaya.
+	// SeverityAttention menandakan adanya aktivitas yang perlu diperhatikan.
 	SeverityAttention Severity = "perhatian"
-	// Bahaya: tindakan segera diperlukan untuk melindungi diri.
+	// SeverityDanger menandakan ancaman aktif yang membutuhkan tindakan segera.
 	SeverityDanger Severity = "bahaya"
 )
 
-// Alert merekam satu peringatan keamanan yang dapat ditampilkan kepada pengguna
-// dalam bahasa Indonesia yang mudah dipahami.
+// Alert merekam satu insiden keamanan yang dapat ditampilkan kepada pengguna.
 type Alert struct {
-	ID          int64     // Kunci utama SQLite (auto-increment)
-	Timestamp   time.Time // Waktu peringatan dibuat (diisi oleh Raise jika nol)
-	Severity    Severity  // Tingkat keparahan: "aman", "perhatian", "bahaya"
-	Category    string    // Jenis peringatan: "arp", "mac", "dhcp", "dns", "gateway", "inject"
-	Title       string    // Judul singkat dalam bahasa Indonesia (maks. 8 kata)
-	Explanation string    // Penjelasan 2-3 kalimat dalam bahasa Indonesia tanpa jargon
-	Action      string    // Langkah konkret 1-3 dalam bahasa Indonesia untuk pengguna
-	Technical   string    // Detail teknis (IP, MAC, port) untuk pengguna lanjutan
-	DeviceMAC   string    // MAC perangkat terkait (jika ada)
+	ID          int64     // ID unik peringatan
+	Timestamp   time.Time // Waktu terjadinya insiden
+	Severity    Severity  // Tingkat keparahan: "aman" | "perhatian" | "bahaya"
+	Category    string    // Kategori: "arp" | "mac" | "dhcp" | "dns" | "gateway" | "inject"
+	Title       string    // Judul singkat (maks 8 kata) dalam bahasa Indonesia
+	Explanation string    // Penjelasan 2-3 kalimat tanpa jargon teknis
+	Action      string    // Langkah tindakan konkret 1-3 langkah
+	Technical   string    // Detail teknis (IP, MAC, dsb) untuk investigasi lebih lanjut
+	DeviceMAC   string    // Alamat MAC perangkat terkait jika ada
 }
 
-// Engine mengelola pembuatan dan penyimpanan peringatan.
+// Broadcaster mendefinisikan kontrak untuk menyiarkan peringatan ke SSE hub.
+type Broadcaster interface {
+	Broadcast(event string, data any)
+}
+
+// Engine mengelola pembuatan, penyimpanan, dan pengakuan peringatan keamanan.
 type Engine struct {
-	db *storage.DB
+	db          *storage.DB
+	mu          sync.RWMutex
+	broadcaster Broadcaster
 }
 
-// NewEngine menciptakan instance Engine baru.
+// NewEngine menciptakan instance Engine baru dengan basis data yang diberikan.
 func NewEngine(db *storage.DB) *Engine {
-	return &Engine{db: db}
+	return &Engine{
+		db: db,
+	}
 }
 
-// Raise menyimpan satu Alert ke basis data dan (di masa mendatang)
-// menyebarkannya melalui hub SSE. Jika timestamp Alert adalah nol,
-// waktu saat ini akan digunakan.
-func (e *Engine) Raise(ctx context.Context, a Alert) error {
-	// Apabila timestamp belum diisi, gunakan waktu sekarang.
+// SetBroadcaster menetapkan broadcaster untuk menyiarkan event SSE saat alert baru dibuat.
+func (e *Engine) SetBroadcaster(b Broadcaster) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.broadcaster = b
+}
+
+// Raise memvalidasi peringatan, menetapkan waktu jika belum ada, menyimpannya
+// ke tabel basis data, dan menyiarkannya ke klien melalui SSE hub.
+func (e *Engine) Raise(a Alert) error {
 	if a.Timestamp.IsZero() {
 		a.Timestamp = time.Now()
 	}
 
-	// Validasi ringan: pastikan string wajib tidak kosong.
-	if a.Title == "" || a.Explanation == "" || a.Action == "" {
-		return fmt.Errorf("alert harus memiliki title, explanation, dan action")
+	dbAlert := &storage.Alert{
+		Timestamp:    a.Timestamp,
+		Severity:     string(a.Severity),
+		Category:     a.Category,
+		Title:        a.Title,
+		Explanation:  a.Explanation,
+		Action:       a.Action,
+		Technical:    a.Technical,
+		DeviceMAC:    a.DeviceMAC,
+		Acknowledged: false,
 	}
 
-	// Simpan ke basis data.
-	if _, err := e.db.InsertAlert(&a); err != nil {
-		return fmt.Errorf("gagal menyimpan alert: %w", err)
+	id, err := e.db.InsertAlert(dbAlert)
+	if err != nil {
+		return fmt.Errorf("gagal menyimpan peringatan: %w", err)
+	}
+	a.ID = id
+
+	e.mu.RLock()
+	broadcaster := e.broadcaster
+	e.mu.RUnlock()
+
+	if broadcaster != nil {
+		broadcaster.Broadcast("alert", a)
 	}
 
-	// Di sini seharusnya ada notifikasi ke SSE hub.
-	// Untuk saat ini, cukup log bahwa alert telah dibuat.
-	slog.Info("alert dibuat",
+	slog.Warn("peringatan keamanan terdeteksi",
 		"id", a.ID,
 		"severity", a.Severity,
 		"category", a.Category,
-		"title", a.Title)
+		"title", a.Title,
+	)
 
 	return nil
 }
 
-// Acknowledge menandai Alert dengan ID tertentu sebagai sudah dibaca
-// (acknowledged = true).
-func (e *Engine) Acknowledge(ctx context.Context, id int64) error {
+// Acknowledge menandai peringatan dengan ID tertentu sebagai sudah dibaca.
+func (e *Engine) Acknowledge(id int64) error {
 	if err := e.db.AcknowledgeAlert(id); err != nil {
-		return fmt.Errorf("gagal mengakui alert: %w", err)
+		return fmt.Errorf("gagal mengakui peringatan ID %d: %w", id, err)
 	}
+	slog.Info("peringatan telah ditandai dibaca", "id", id)
 	return nil
 }
 
-// ----- Predefined alert constructors (templates dalam bahasa Indonesia) -----
-
-// ARPSpoofing mengembalikan Alert untuk kecurangan ARP (seorang perangkat
-// berpura-pura menjadi gateway).
+// ARPSpoofing menghasilkan peringatan bahaya saat terdeteksi upaya pemalsuan ARP (ARP spoofing).
 func ARPSpoofing(ip, macA, macB string) Alert {
 	return Alert{
-		Severity: SeverityDanger,
-		Category: "arp",
-		Title:    "Ada perangkat yang berpura-pura jadi router",
-		Explanation: "Seseorang di jaringan ini mencoba menyamar sebagai router " +
-			"Anda. Ini bisa membuat lalu lintas internet Anda dibaca orang lain.",
-		Action:   "Putuskan koneksi WiFi sekarang. Jangan buka aplikasi bank atau " +
-			"login apa pun sampai Anda pindah ke jaringan lain.",
-		Technical: fmt.Sprintf("IP %s dipetakan ke MAC %s lalu berubah ke %s.", ip, macA, macB),
-		DeviceMAC: macB,
+		Severity:    SeverityDanger,
+		Category:    "arp",
+		Title:       "Ada perangkat yang berpura-pura jadi router",
+		Explanation: "Seseorang di jaringan ini mencoba menyamar sebagai router Anda. Ini bisa membuat lalu lintas internet Anda dibaca orang lain.",
+		Action:      "Putuskan koneksi WiFi sekarang. Jangan buka aplikasi bank atau login apa pun sampai Anda pindah ke jaringan lain.",
+		Technical:   fmt.Sprintf("IP %s dipetakan ke MAC %s lalu berubah ke %s.", ip, macA, macB),
+		DeviceMAC:   macB,
 	}
 }
 
-// MACSpoofing mengembalikan Alert untuk kecurangan MAC (dua perangkat
-// menggunakan MAC yang sama).
+// MACSpoofing menghasilkan peringatan bahaya saat terdeteksi alamat MAC yang sama dengan identitas berbeda.
 func MACSpoofing(mac, vendorA, vendorB string) Alert {
 	return Alert{
-		Severity: SeverityDanger,
-		Category: "mac",
-		Title:    "Dua perangkat menggunakan alamat MAC yang sama",
-		Explanation: "Dua perangkat berbeda dalam jaringan ini menggunakan " +
-			"alamat MAC identik. Ini mungkin menunjukkan kecurangan atau " +
-			"konfigurasi yang salah.",
-		Action:   "Periksa perangkat yang terhubung ke jaringan. Jika Anda tidak " +
-			"mengenali satu perangkat, putuskan koneksinya dari jaringan.",
-		Technical: fmt.Sprintf("MAC %s digunakan oleh perangkat dengan vendor '%s' " +
-			"dan juga oleh perangkat dengan vendor '%s'.", mac, vendorA, vendorB),
-		DeviceMAC: mac,
+		Severity:    SeverityDanger,
+		Category:    "mac",
+		Title:       "Dua perangkat memakai tanda pengenal yang sama",
+		Explanation: "Ada dua perangkat berbeda yang menggunakan alamat fisik jaringan yang sama persis. Hal ini sering terjadi saat seseorang mencoba meniru perangkat lain.",
+		Action:      "Hindari berbagi berkas atau memasukkan kata sandi penting. Hubungi pengelola jaringan bila di kantor.",
+		Technical:   fmt.Sprintf("MAC %s terdeteksi untuk vendor %s dan %s.", mac, vendorA, vendorB),
+		DeviceMAC:   mac,
 	}
 }
 
-// RogueDHCP mengembalikan Alert untuk server DHCP tidak sah yang mungkin
-// memberikan konfigurasi jaringan berbahaya.
+// RogueDHCP menghasilkan peringatan bahaya saat ada server DHCP liar yang mencoba membagikan konfigurasi IP.
 func RogueDHCP(serverIP, serverMAC string) Alert {
 	return Alert{
-		Severity: SeverityDanger,
-		Category: "dhcp",
-		Title:    "Server DHCP tidak terdeteksi sebelumnya aktif",
-		Explanation: "Ada perangkat yang berper sebagai server DHCP tanpa " +
-			"izin atau tidak dikenal sebelumnya dalam jaringan Anda. " +
-			"Perangkat ini bisa memberikan konfigurasi jaringan yang mengarahkan " +
-			"lalu lintas Anda ke jalur yang tidak diinginkan.",
-		Action:   "Matikan perangkat yang memberikan layanan DHCP ini jika Anda " +
-			"tidak mengenalnya. Laporkan ke pengelola jaringan jika Anda di kantor " +
-			" atau jaringan publik.",
-		Technical: fmt.Sprintf("Server DHCP beralamat IP %s dengan MAC %s", serverIP, serverMAC),
-		DeviceMAC: serverMAC,
+		Severity:    SeverityDanger,
+		Category:    "dhcp",
+		Title:       "Server jaringan tidak dikenal mencoba mengatur koneksi Anda",
+		Explanation: "Ada perangkat yang mencoba bertindak sebagai pengatur alamat jaringan (DHCP) palsu. Perangkat ini berpotensi mengarahkan lalu lintas internet Anda ke situs berbahaya.",
+		Action:      "Putuskan sambungan dan laporkan ke pengelola jaringan bila berada di tempat kerja atau publik.",
+		Technical:   fmt.Sprintf("DHCP offer diterima dari server liar IP %s (MAC %s).", serverIP, serverMAC),
+		DeviceMAC:   serverMAC,
 	}
 }
 
-// GatewayChange mengembalikan Alert ketika MAC gateway berubah secara
-// tiba-tiba (mungkin indikasi seranganMan-in-the-Middle).
+// GatewayChange menghasilkan peringatan perhatian saat alamat router (gateway) berubah secara mendadak.
 func GatewayChange(oldMAC, newMAC string) Alert {
 	return Alert{
-		Severity: SeverityAttention,
-		Category: "gateway",
-		Title:    "Perangkat gateway telah berubah",
-		Explanation: "Perangkat yang biasa Anda gunakan sebagai gateway " +
-			"(router ke internet) telah berubah alamat MAC-nya. " +
-			"Ini bisa normal jika Anda baru saja mengganti router, " +
-			"tapi juga bisa menjadi indikasi seseorang mencoba menyintersept " +
-			"lalu lintas Anda.",
-		Action:   "Verifikasi bahwa perubahan ini sengaja Anda lakukan. " +
-			"Jika tidak, putuskan dari jaringan dan mulai ulang router Anda.",
-		Technical: fmt.Sprintf("Gateway MAC berubah dari %s menjadi %s", oldMAC, newMAC),
-		DeviceMAC: newMAC,
+		Severity:    SeverityAttention,
+		Category:    "gateway",
+		Title:       "Alamat router utama Anda berubah",
+		Explanation: "Koneksi gateway jaringan Anda tiba-tiba berpindah ke perangkat lain. Hal ini wajar jika router baru saja diganti atau di-restart.",
+		Action:      "Sambung ulang WiFi Anda untuk memastikan koneksi kembali ke router resmi yang benar.",
+		Technical:   fmt.Sprintf("Gateway MAC berubah dari %s menjadi %s.", oldMAC, newMAC),
+		DeviceMAC:   newMAC,
 	}
 }
 
-// SuspiciousDNS mengembalikan Alert ketika terdapat respons DNS ke domain
-// yang terkait dengan aktivitas berbahaya.
+// SuspiciousDNS menghasilkan peringatan perhatian saat domain mencurigakan diarahkan ke alamat tak lazim.
 func SuspiciousDNS(domain, answerIP string) Alert {
 	return Alert{
-		Severity: SeverityAttention,
-		Category: "dns",
-		Title:    "Permintaan DNS ke domain mencurigakan",
-		Explanation: "Ada perangkat dalam jaringan Anda yang melakukan " +
-			"permintaan nama domain yang sering dikaitkan dengan malware, " +
-			"phishing, atau aktivitas berbahaya lainnya. " +
-			"Domain yang diminta: " + domain,
-		Action:   "Periksa perangkat yang membuat permintaan DNS ini. " +
-			"Jika tidak dikenal, pertimbangkan untuk memutuskan koneksinya " +
-			"dari jaringan sementara waktu.",
-		Technical: fmt.Sprintf("DNS request for %s returned IP %s", domain, answerIP),
+		Severity:    SeverityAttention,
+		Category:    "dns",
+		Title:       "Pengalihan alamat situs yang mencurigakan",
+		Explanation: "Situs web yang diakses diarahkan ke alamat server yang tidak biasa. Ini dapat mengindikasikan upaya pengalihan ke situs tiruan.",
+		Action:      "Hindari transaksi online atau memasukkan data pribadi di jaringan ini untuk sementara.",
+		Technical:   fmt.Sprintf("Domain %s diarahkan ke IP tidak biasa: %s.", domain, answerIP),
 	}
 }
 
-// ScriptInjection mengembalikan Alert ketika terdeteksi upaya penyisipan
-// skrip dalam lalu lintas HTTP (indikasi XSS atau middleware berbahaya).
+// ScriptInjection menghasilkan peringatan bahaya saat terdeteksi penyisipan kode berbahaya dalam lalu lintas web.
 func ScriptInjection(host, evidence string) Alert {
 	return Alert{
-		Severity: SeverityDanger,
-		Category: "inject",
-		Title:    "Terdeteksi upaya penyisipan skrip dalam lalu lintas",
-		Explanation: "Ada indikasi bahwa seseorang dalam jaringan ini mencoba " +
-			"menyisipkan kode berbahaya ke dalam lalu lintas HTTP Anda. " +
-			"Ini bisa berupa upaya mencuri cookie, session token, atau data " +
-			"sensitif lainnya.",
-		Action:   "Segera tutup semua tab browser dan jangan masuk ke situs " +
-			"apapun yang membutuhkan login sampai Anda pindah ke jaringan lain " +
-			"dan membersihkan cache browser Anda.",
-		Technical: fmt.Sprintf("Host: %s, Evidence: %s", host, evidence),
+		Severity:    SeverityDanger,
+		Category:    "inject",
+		Title:       "Penyisipan kode berbahaya dalam halaman web",
+		Explanation: "Ditemukan kode yang tidak diinginkan disisipkan ke dalam halaman web yang sedang Anda buka. Ini berpotensi mencuri data pribadi.",
+		Action:      "Tutup browser Anda sekarang juga dan jangan login ke akun apa pun sampai Anda berpindah ke jaringan yang aman.",
+		Technical:   fmt.Sprintf("Host: %s, Bukti potongan muatan: %s.", host, evidence),
 	}
 }

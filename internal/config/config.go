@@ -116,7 +116,10 @@ func Load() (*Config, error) {
 
 	// --- Log level ---
 	if v := os.Getenv("SHADOWSCANNER_LOG_LEVEL"); v != "" {
-		cfg.LogLevel = v
+		cfg.LogLevel = strings.ToLower(strings.TrimSpace(v))
+	}
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = DefaultLogLevel
 	}
 
 	// --- Max devices ---

@@ -1,13 +1,16 @@
-// Package connections menyediakan pemantauan koneksi jaringan aktif
+// Package local menyediakan pemantauan koneksi jaringan aktif
 // pada perangkat pengguna dalam bahasa Indonesia yang mudah dipahami.
 package local
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
+	"sync"
 	"time"
 
-	"github.com/shirou/gopsutil/v4/process"
-	"github.com/shirou/gopsutil/v4/net"
+	"github.com/shirou/gopsutil/v3/net"
+	"github.com/shirou/gopsutil/v3/process"
 	"shadowscanner/internal/config"
 	"shadowscanner/internal/storage"
 )
@@ -27,173 +30,210 @@ type ConnInfo struct {
 	ProcessPID  int       // ID proses yang membuka koneksi
 }
 
-// Watcher mengelola pemantauan koneksi berkala dan penyimpanan baru
-// ke basis data serta pengiriman lewat SSE hub.
-type Watcher struct {
-	cfg     *config.Config
-	db      *storage.DB
-	ticker  *time.Ticker
-	stopCh  chan struct{}
-	lastMap map[string]struct{} // fingerprint koneksi yang sudah dilihat
+// Broadcaster mendefinisikan antarmuka untuk menyiarkan koneksi baru ke SSE hub.
+type Broadcaster interface {
+	Broadcast(event string, data any)
 }
 
-// NewWatcher menciptakan instance Watcher baru dengan konfigurasi dan
-// basis data yang diberikan.
+// Watcher mengelola pemantauan koneksi berkala dan penyimpanan koneksi baru
+// ke basis data serta siaran lewat SSE hub.
+type Watcher struct {
+	cfg         *config.Config
+	db          *storage.DB
+	ticker      *time.Ticker
+	stopCh      chan struct{}
+	mu          sync.Mutex
+	lastMap     map[string]struct{}
+	running     bool
+	broadcaster Broadcaster
+}
+
+// NewWatcher menciptakan instance Watcher baru dengan konfigurasi dan basis data yang diberikan.
 func NewWatcher(cfg *config.Config, db *storage.DB) (*Watcher, error) {
 	if cfg == nil {
-		return nil, fmt.Errorf("config is required")
+		return nil, fmt.Errorf("config tidak boleh nil")
 	}
 	if db == nil {
-		return nil, fmt.Errorf("database is required")
+		return nil, fmt.Errorf("storage db tidak boleh nil")
+	}
+	interval := cfg.ScanIntervalSec
+	if interval < 10 {
+		interval = 60
 	}
 	return &Watcher{
 		cfg:     cfg,
 		db:      db,
-		ticker:  time.NewTicker(time.Duration(cfg.ScanIntervalSec) * time.Second),
+		ticker:  time.NewTicker(time.Duration(interval) * time.Second),
 		stopCh:  make(chan struct{}),
 		lastMap: make(map[string]struct{}),
 	}, nil
 }
 
-// Start memulai pemantauan koneksi dalam goroutine terpisah.
-// Setiap interval, ambil snapshot koneksi, bandingkan dengan snapshot
-// sebelumnya, dan simpan yang baru ke basis data.
-func (w *Watcher) Start(ctx context.Context) error {
-	go func() {
-		// Ambil snapshot awal untuk initialize lastMap
-		initial, err := w.Snapshot(ctx)
-		if err != nil {
-			slog.Error("gagal mengambil snapshot koneksi awal", "error", err)
-		} else {
-			for _, conn := range initial {
-				fp := connFingerprint(conn)
-				w.lastMap[fp] = struct{}{}
-			}
-		}
+// SetBroadcaster menetapkan broadcaster SSE untuk mengirim event koneksi baru.
+func (w *Watcher) SetBroadcaster(b Broadcaster) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.broadcaster = b
+}
 
+// Start memulai pemantauan koneksi dalam goroutine berkala.
+func (w *Watcher) Start(ctx context.Context) error {
+	w.mu.Lock()
+	if w.running {
+		w.mu.Unlock()
+		return fmt.Errorf("watcher sudah berjalan")
+	}
+	w.running = true
+	w.mu.Unlock()
+
+	// Snapshot awal untuk mengisi map perbandingan
+	initial, err := w.Snapshot()
+	if err == nil {
+		w.mu.Lock()
+		for _, conn := range initial {
+			w.lastMap[connFingerprint(conn)] = struct{}{}
+		}
+		w.mu.Unlock()
+	} else {
+		slog.Warn("gagal mengambil snapshot koneksi awal", "error", err)
+	}
+
+	go func() {
 		for {
 			select {
 			case <-w.ticker.C:
-				snap, err := w.Snapshot(ctx)
+				current, err := w.Snapshot()
 				if err != nil {
-					slog.Error("gagal mengambil snapshot koneksi", "error", err)
+					slog.Warn("gagal mengambil snapshot koneksi", "error", err)
 					continue
 				}
+
 				var newConns []ConnInfo
-				for _, conn := range snap {
+				w.mu.Lock()
+				for _, conn := range current {
 					fp := connFingerprint(conn)
 					if _, exists := w.lastMap[fp]; !exists {
-						newConns = append(newConns, conn)
 						w.lastMap[fp] = struct{}{}
+						newConns = append(newConns, conn)
 					}
 				}
-				// Simpan koneksi baru ke basis data
+				broadcaster := w.broadcaster
+				w.mu.Unlock()
+
+				// Simpan hanya koneksi baru ke basis data
 				for _, conn := range newConns {
-					if err := w.db.InsertConnection(&conn); err != nil {
-						slog.Error("gagal menyimpan koneksi baru", "error", err, "conn", conn)
-					} else {
-						slog.Debug("koneksi baru disimpan", "local_ip", conn.LocalIP, "local_port", conn.LocalPort, "remote_ip", conn.RemoteIP, "remote_port", conn.RemotePort)
+					dbConn := &storage.Connection{
+						Timestamp:   conn.Timestamp,
+						Direction:   conn.Direction,
+						LocalIP:     conn.LocalIP,
+						LocalPort:   conn.LocalPort,
+						RemoteIP:    conn.RemoteIP,
+						RemotePort:  conn.RemotePort,
+						Protocol:    conn.Protocol,
+						ProcessName: conn.ProcessName,
+						ProcessPID:  conn.ProcessPID,
+						State:       conn.State,
+					}
+					if err := w.db.InsertConnection(dbConn); err != nil {
+						slog.Debug("catatan: gagal menyimpan koneksi", "error", err)
+					}
+					if broadcaster != nil {
+						broadcaster.Broadcast("connection", conn)
 					}
 				}
-				// TODO: Broadcast newConns lewat SSE hub (dihandle di tempat lain)
+
 			case <-w.stopCh:
-				w.ticker.Stop()
 				return
 			case <-ctx.Done():
-				w.ticker.Stop()
 				return
 			}
 		}
 	}()
+
 	return nil
 }
 
-// Stop menghentikan pemantauan koneksi dan membersihkan sumber daya.
-func (w *Watcher) Stop() {
+// Stop menghentikan pemantauan koneksi dan membersihkan timer.
+func (w *Watcher) Stop() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.running {
+		return nil
+	}
+	w.running = false
+	w.ticker.Stop()
 	close(w.stopCh)
+	return nil
 }
 
 // Snapshot mengembalikan daftar koneksi aktif saat ini.
-// Fungsi ini read-only dan tidak mengubah sistem apa pun.
-func (w *Watcher) Snapshot(ctx context.Context) ([]ConnInfo, error) {
-	var conns []ConnInfo
+// Fungsi ini read-only dan aman dari segi hak akses.
+func (w *Watcher) Snapshot() ([]ConnInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-	// Dapatkan koneksi TCP dan UDP
 	tcpConns, err := net.ConnectionsWithContext(ctx, "tcp")
 	if err != nil {
-		return nil, fmt.Errorf("get TCP connections: %w", err)
-	}
-	udpConns, err := net.ConnectionsWithContext(ctx, "udp")
-	if err != nil {
-		return nil, fmt.Errorf("get UDP connections: %w", err)
+		return nil, fmt.Errorf("gagal membaca koneksi TCP: %w", err)
 	}
 
+	udpConns, _ := net.ConnectionsWithContext(ctx, "udp")
 	allConns := append(tcpConns, udpConns...)
+
+	now := time.Now()
+	var results []ConnInfo
+
 	for _, c := range allConns {
-		// Arah koneksi: masuk jika listen atau port lokal adalah port yang diketahui
 		direction := "keluar"
-		if c.Status == "LISTEN" || isKnownListenerPort(c.Laddr.Port) {
+		if c.Status == "LISTEN" || isKnownListenerPort(int(c.Laddr.Port)) {
 			direction = "masuk"
 		}
 
-		// Dapatkan nama proses
-		processName := "Tidak diketahui"
-		if c.Pid != 0 {
+		procName := "Tidak diketahui"
+		if c.Pid > 0 {
 			if p, err := process.NewProcess(c.Pid); err == nil {
-				if name, err := p.Name(); err == nil {
-					processName = name
+				if n, err := p.Name(); err == nil && n != "" {
+					procName = n
 				}
 			}
+		} else if c.Pid == 0 {
+			procName = "Tidak diketahui (butuh izin)"
+		}
+
+		proto := "TCP"
+		if c.Type == 2 {
+			proto = "UDP"
 		}
 
 		conn := ConnInfo{
-			Timestamp:   time.Unix(0, c.CreateTimestamp*1000000), // gopsutil returns microseconds
+			Timestamp:   now,
 			Direction:   direction,
 			LocalIP:     c.Laddr.IP,
 			LocalPort:   int(c.Laddr.Port),
 			RemoteIP:    c.Raddr.IP,
 			RemotePort:  int(c.Raddr.Port),
-			Protocol:    strings.ToUpper(c.Type),
+			Protocol:    proto,
 			State:       c.Status,
-			ProcessName: processName,
+			ProcessName: procName,
 			ProcessPID:  int(c.Pid),
 		}
-		conns = append(conns, conn)
+		results = append(results, conn)
 	}
 
-	return conns, nil
+	return results, nil
 }
 
-// isKnownListenerPort mengembalikan true jika port merupakan port
-// yang umum digunakan untuk layanan yang menerima koneksi.
+// isKnownListenerPort memeriksa apakah port termasuk port layanan yang biasa menerima koneksi.
 func isKnownListenerPort(port int) bool {
-	// Port umum untuk layanan server
 	switch port {
-	case 20, 21, // FTP
-		22, // SSH
-		23, // Telnet
-		25, // SMTP
-		53, // DNS
-		80, // HTTP
-		110, // POP3
-		139, // NetBIOS
-		143, // IMAP
-		443, // HTTPS
-		445, // SMB
-		3306, // MySQL
-		3389, // RDP
-		5432, // PostgreSQL
-		5900, // VNC
-		6379, // Redis
-		8080, // HTTP alt
-		8443: // HTTPS alt
+	case 21, 22, 23, 25, 53, 80, 110, 139, 143, 443, 445, 3306, 3389, 5432, 8080, 8443:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
-// connFingerprint menghasilkan string unik untuk mengidentifikasi koneksi
-// berdasarkan 5-tuple: local IP, local port, remote IP, remote port, protocol.
+// connFingerprint membuat kunci unik untuk koneksi berdasarkan pasangan IP/Port dan protokol.
 func connFingerprint(c ConnInfo) string {
 	return fmt.Sprintf("%s:%d-%s:%d-%s", c.LocalIP, c.LocalPort, c.RemoteIP, c.RemotePort, c.Protocol)
 }
